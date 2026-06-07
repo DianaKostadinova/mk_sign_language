@@ -1,0 +1,49 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# ── Virtual environment ───────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+
+# ── Downloaded videos (large binary data — not for git) ──────────────────────
+videos/
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# ── ML data & model artifacts ─────────────────────────────────────────────────
+data/
+*.npy
+*.npz
+*.pkl
+*.pt
+*.pth
+*.h5
+*.ckpt
+models/
+
+# ── Notebooks output ──────────────────────────────────────────────────────────
+notebooks/.ipynb_checkpoints/
+*.ipynb_checkpoints/
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.iml
+
+# ── Claude Code ───────────────────────────────────────────────────────────────
+.claude/
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
