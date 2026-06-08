@@ -27,37 +27,41 @@ from utils import normalize_landmarks, landmarks_from_result
 # ── Paths ─────────────────────────────────────────────────────────────────────
 ROOT       = Path(__file__).parent.parent
 MODEL_PATH = ROOT / "data" / "hand_landmarker.task"
-WEIGHTS    = ROOT / "models" / "mlp_letters.pt"
+WEIGHTS    = ROOT / "models" / "lstm_letters.pt"
 LABELS     = ROOT / "models" / "label_encoder.npy"
 
 # ── Load model ────────────────────────────────────────────────────────────────
-class MLP(nn.Module):
-    def __init__(self, input_dim, hidden_dims, n_classes, dropout):
+class SignLSTM(nn.Module):
+    def __init__(self, input_dim, hidden, layers, n_classes, dropout):
         super().__init__()
-        layers = []
-        prev = input_dim
-        for h in hidden_dims:
-            layers += [nn.Linear(prev, h), nn.ReLU(), nn.Dropout(dropout)]
-            prev = h
-        layers.append(nn.Linear(prev, n_classes))
-        self.net = nn.Sequential(*layers)
+        self.lstm = nn.LSTM(input_dim, hidden, layers,
+                            batch_first=True,
+                            dropout=dropout if layers > 1 else 0.0)
+        self.head = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 64),
+            nn.ReLU(),
+            nn.Linear(64, n_classes),
+        )
 
     def forward(self, x):
-        return self.net(x)
+        _, (h_n, _) = self.lstm(x)
+        return self.head(h_n[-1])
 
 
 def load_model():
-    checkpoint   = torch.load(WEIGHTS, map_location="cpu")
-    label_names  = np.load(LABELS, allow_pickle=True)
-    model = MLP(
+    checkpoint  = torch.load(WEIGHTS, map_location="cpu")
+    label_names = np.load(LABELS, allow_pickle=True)
+    model = SignLSTM(
         checkpoint["input_dim"],
-        checkpoint["hidden_dims"],
+        checkpoint["lstm_hidden"],
+        checkpoint["lstm_layers"],
         checkpoint["n_classes"],
         checkpoint["dropout"],
     )
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
-    return model, label_names
+    return model, label_names, checkpoint["seq_len"]
 
 
 # ── MediaPipe detector (IMAGE mode for per-frame inference) ───────────────────
@@ -72,30 +76,22 @@ def make_detector():
     return mp_vision.HandLandmarker.create_from_options(options)
 
 
-# ── Inference on a single frame ───────────────────────────────────────────────
+# ── Inference on a rolling frame buffer ──────────────────────────────────────
 @torch.no_grad()
-def predict(frame_bgr, detector, model, label_names):
-    frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    mp_image  = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
-    result    = detector.detect(mp_image)
+def predict(seq_buffer: list, model, label_names, seq_len: int):
+    """Run LSTM on the current frame buffer. Returns label, confidence."""
+    if len(seq_buffer) < seq_len:
+        return None, 0.0
 
-    raw = landmarks_from_result(result)
-    if raw is None:
-        return None, 0.0, None
+    # Evenly sample seq_len frames from the buffer
+    indices = np.linspace(0, len(seq_buffer) - 1, seq_len, dtype=int)
+    seq     = np.array([seq_buffer[i] for i in indices], dtype=np.float32)
+    tensor  = torch.from_numpy(seq).unsqueeze(0)   # (1, seq_len, 63)
 
-    normalized = normalize_landmarks(raw)
-    tensor     = torch.from_numpy(normalized.astype(np.float32)).unsqueeze(0)
-    logits     = model(tensor)
-    probs      = torch.softmax(logits, dim=1)[0]
-    top_idx    = probs.argmax().item()
-    confidence = probs[top_idx].item()
-    label      = label_names[top_idx]
-
-    # Also return all landmark points for drawing
-    h, w = frame_bgr.shape[:2]
-    pts = [(int(lm.x * w), int(lm.y * h)) for lm in result.hand_landmarks[0]]
-
-    return label, confidence, pts
+    logits = model(tensor)
+    probs  = torch.softmax(logits, dim=1)[0]
+    top    = probs.argmax().item()
+    return label_names[top], probs[top].item()
 
 
 # ── Draw skeleton on frame ────────────────────────────────────────────────────
@@ -143,7 +139,7 @@ def draw_skeleton(frame, pts):
 # ── Main loop ─────────────────────────────────────────────────────────────────
 def main():
     print("Loading model ...")
-    model, label_names = load_model()
+    model, label_names, seq_len = load_model()
     detector = make_detector()
 
     cap = cv2.VideoCapture(0)
@@ -151,18 +147,44 @@ def main():
         print("Could not open webcam.")
         return
 
-    print("Webcam open. Press Q to quit.\n")
+    print(f"Webcam open. Hold a sign steady for ~{seq_len} frames. Press Q to quit.\n")
+
+    # Rolling buffer — stores the last seq_len*2 detected landmark frames
+    buffer: list = []
+    BUFFER_MAX = seq_len * 2
 
     while True:
         ok, frame = cap.read()
         if not ok:
             break
 
-        frame = cv2.flip(frame, 1)   # mirror so it feels natural
-        label, confidence, pts = predict(frame, detector, model, label_names)
+        frame = cv2.flip(frame, 1)
+
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image  = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+        result    = detector.detect(mp_image)
+        raw       = landmarks_from_result(result)
+
+        pts = None
+        if raw is not None:
+            from utils import normalize_landmarks
+            normalized = normalize_landmarks(raw)
+            buffer.append(normalized)
+            if len(buffer) > BUFFER_MAX:
+                buffer.pop(0)
+
+            h, w = frame.shape[:2]
+            pts  = [(int(lm.x * w), int(lm.y * h)) for lm in result.hand_landmarks[0]]
+        else:
+            # Hand lost — slowly drain the buffer so prediction fades out
+            if buffer:
+                buffer.pop(0)
+
+        label, confidence = predict(buffer, model, label_names, seq_len)
 
         if label is not None and confidence > 0.2:
-            draw_skeleton(frame, pts)
+            if pts:
+                draw_skeleton(frame, pts)
             frame = put_text_unicode(frame, label, (30, 20), 80, (0, 255, 0))
             bar_w = int(300 * confidence)
             cv2.rectangle(frame, (30, 110), (30 + bar_w, 130), (0, 255, 0), -1)
