@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import mediapipe as mp
 from pathlib import Path
+from PIL import Image, ImageDraw, ImageFont
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 
@@ -65,7 +66,7 @@ def make_detector():
     options = mp_vision.HandLandmarkerOptions(
         base_options=base_options,
         running_mode=mp_vision.RunningMode.IMAGE,
-        num_hands=1,
+        num_hands=2,
         min_hand_detection_confidence=0.5,
     )
     return mp_vision.HandLandmarker.create_from_options(options)
@@ -107,6 +108,31 @@ CONNECTIONS = [
     (5,9),(9,13),(13,17),            # palm
 ]
 
+# Try to find a system font that supports Cyrillic
+def _find_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    candidates = [
+        "arial.ttf", "arialuni.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/arialuni.ttf",
+        "C:/Windows/Fonts/seguiui.ttf",
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size)
+        except (IOError, OSError):
+            continue
+    return ImageFont.load_default()
+
+
+def put_text_unicode(frame: np.ndarray, text: str, pos: tuple, size: int, color: tuple) -> np.ndarray:
+    """Draw Unicode text on an OpenCV frame using Pillow."""
+    img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    draw    = ImageDraw.Draw(img_pil)
+    font    = _find_font(size)
+    draw.text(pos, text, font=font, fill=color)
+    return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+
+
 def draw_skeleton(frame, pts):
     for a, b in CONNECTIONS:
         cv2.line(frame, pts[a], pts[b], (0, 200, 0), 2)
@@ -135,23 +161,17 @@ def main():
         frame = cv2.flip(frame, 1)   # mirror so it feels natural
         label, confidence, pts = predict(frame, detector, model, label_names)
 
-        if label is not None and confidence > 0.6:
+        if label is not None and confidence > 0.2:
             draw_skeleton(frame, pts)
-            # Large letter display
-            cv2.putText(frame, label, (30, 90),
-                        cv2.FONT_HERSHEY_SIMPLEX, 3.0, (0, 255, 0), 4)
-            # Confidence bar
+            frame = put_text_unicode(frame, label, (30, 20), 80, (0, 255, 0))
             bar_w = int(300 * confidence)
             cv2.rectangle(frame, (30, 110), (30 + bar_w, 130), (0, 255, 0), -1)
-            cv2.putText(frame, f"{confidence:.0%}", (340, 128),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            frame = put_text_unicode(frame, f"{confidence:.0%}", (340, 112), 24, (255, 255, 255))
         elif pts is not None:
             draw_skeleton(frame, pts)
-            cv2.putText(frame, "?", (30, 90),
-                        cv2.FONT_HERSHEY_SIMPLEX, 3.0, (0, 100, 255), 4)
+            frame = put_text_unicode(frame, "?", (30, 20), 80, (0, 100, 255))
         else:
-            cv2.putText(frame, "No hand detected", (30, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+            frame = put_text_unicode(frame, "No hand detected", (30, 30), 28, (0, 0, 255))
 
         cv2.imshow("MK Sign Language — Alphabet", frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):

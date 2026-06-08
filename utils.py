@@ -43,10 +43,17 @@ def normalize_landmarks(landmarks: np.ndarray) -> np.ndarray:
 def landmarks_from_result(result) -> np.ndarray | None:
     """
     Extract a (21, 3) numpy array from a MediaPipe HandLandmarker result.
+    If multiple hands are detected, picks the one with the highest confidence.
     Returns None if no hand was detected.
     """
     if not result.hand_landmarks:
         return None
 
-    hand = result.hand_landmarks[0]   # first (dominant) hand
+    if len(result.hand_landmarks) == 1:
+        hand = result.hand_landmarks[0]
+    else:
+        # Pick the hand with the highest handedness score
+        scores = [result.handedness[i][0].score for i in range(len(result.hand_landmarks))]
+        hand   = result.hand_landmarks[int(np.argmax(scores))]
+
     return np.array([[lm.x, lm.y, lm.z] for lm in hand], dtype=np.float32)
