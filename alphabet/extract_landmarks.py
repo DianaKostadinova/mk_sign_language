@@ -29,6 +29,11 @@ SEQ_LEN = 20
 WINDOW_START = 0.20
 WINDOW_END   = 0.80
 
+# Sliding-window extraction: number of sequences to pull per video
+SEQS_PER_VIDEO = 30
+# Step size between window starts (in detected-frame indices)
+WINDOW_STEP    = 3
+
 
 # ── MediaPipe setup ───────────────────────────────────────────────────────────
 def make_detector():
@@ -44,32 +49,25 @@ def make_detector():
 
 
 # ── Sequence extraction ───────────────────────────────────────────────────────
-def extract_sequence(video_path: Path, detector) -> np.ndarray | None:
+def extract_all_sequences(video_path: Path, detector) -> list[np.ndarray]:
     """
-    Extract a fixed-length sequence of normalized landmark frames.
+    Extract multiple fixed-length sequences from a single video using a
+    sliding window over the detected frames.
 
-    Steps:
-      1. Decode all frames from the middle 60% of the video
-      2. Run MediaPipe on each frame, keep only those with a detected hand
-      3. Evenly sample SEQ_LEN frames from the detected frames
-      4. Normalize each frame
-
-    Returns (SEQ_LEN, 63) or None if not enough frames were detected.
+    Returns a list of (SEQ_LEN, 63) arrays; empty list if detection fails.
     """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         print(f"  [WARN] Could not open {video_path.name}")
-        return None
+        return []
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     start_frame  = int(total_frames * WINDOW_START)
     end_frame    = int(total_frames * WINDOW_END)
 
-    # Seek to the start of our window
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
-    detected_frames = []   # list of (63,) normalized landmark vectors
-
+    detected_frames = []
     for _ in range(end_frame - start_frame):
         ok, frame = cap.read()
         if not ok:
@@ -83,14 +81,18 @@ def extract_sequence(video_path: Path, detector) -> np.ndarray | None:
 
     cap.release()
 
-    if len(detected_frames) < 4:
-        print(f"  [WARN] Too few frames with hand detected: {video_path.name} ({len(detected_frames)} frames)")
-        return None
+    if len(detected_frames) < SEQ_LEN:
+        print(f"  [WARN] Too few detected frames: {video_path.name} ({len(detected_frames)})")
+        return []
 
-    # Evenly sample SEQ_LEN indices from whatever was detected
-    indices = np.linspace(0, len(detected_frames) - 1, SEQ_LEN, dtype=int)
-    sequence = np.array([detected_frames[i] for i in indices], dtype=np.float32)
-    return sequence   # (SEQ_LEN, 63)
+    sequences = []
+    start = 0
+    while start + SEQ_LEN <= len(detected_frames) and len(sequences) < SEQS_PER_VIDEO:
+        window = detected_frames[start : start + SEQ_LEN]
+        sequences.append(np.array(window, dtype=np.float32))
+        start += WINDOW_STEP
+
+    return sequences
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -113,12 +115,11 @@ def main():
 
     for i, video_path in enumerate(letter_videos, 1):
         label = video_path.stem.split(" – ")[0].strip()
-        print(f"[{i:02d}/{len(letter_videos)}] {label}  ({video_path.name})")
-
-        seq = extract_sequence(video_path, detector)
-        if seq is not None:
-            sequences.append(seq)
-            labels.append(label)
+        seqs = extract_all_sequences(video_path, detector)
+        print(f"[{i:02d}/{len(letter_videos)}] {label}  → {len(seqs)} sequences")
+        if seqs:
+            sequences.extend(seqs)
+            labels.extend([label] * len(seqs))
         else:
             failed.append(label)
 

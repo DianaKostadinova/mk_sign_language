@@ -13,6 +13,7 @@ from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -176,18 +177,22 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}\n")
 
-    # Fixed validation set — augmented sequences held out before training
-    VAL_SAMPLES = 50
+    # Stratified split — val samples are fully excluded from training
+    X_train_raw, X_val_raw, y_train, y_val_raw = train_test_split(
+        X_raw, y, test_size=0.15, stratify=y, random_state=42
+    )
+
+    # Augment the held-out val set once for a stable evaluation target
+    VAL_AUG = 10
     X_val_list, y_val_list = [], []
-    for cls in range(n_classes):
-        idx = np.where(y == cls)[0][0]
-        for _ in range(VAL_SAMPLES):
-            X_val_list.append(augment_sequence(X_raw[idx]))
-            y_val_list.append(cls)
+    for x_seq, label in zip(X_val_raw, y_val_raw):
+        for _ in range(VAL_AUG):
+            X_val_list.append(augment_sequence(x_seq))
+            y_val_list.append(label)
     X_val = np.array(X_val_list, dtype=np.float32)
     y_val = np.array(y_val_list, dtype=np.int64)
 
-    train_dataset = LetterSeqDataset(X_raw, y, SAMPLES_PER_CLASS)
+    train_dataset = LetterSeqDataset(X_train_raw, y_train, SAMPLES_PER_CLASS)
     train_loader  = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
 
     model     = SignLSTM(63, LSTM_HIDDEN, LSTM_LAYERS, n_classes, DROPOUT).to(device)
