@@ -1,11 +1,3 @@
-"""
-Live webcam demo — shows the predicted letter in real time.
-
-Run from project root:
-    python alphabet/live_demo.py
-
-Press Q to quit.
-"""
 
 import sys
 import cv2
@@ -22,13 +14,15 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 sys.path.append(str(Path(__file__).parent.parent))
-from utils import normalize_landmarks, landmarks_from_result
+from utils import (normalize_landmarks, landmarks_from_result,
+                   normalize_arm_landmarks, pose_landmarks_from_result)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-ROOT       = Path(__file__).parent.parent
-MODEL_PATH = ROOT / "data" / "hand_landmarker.task"
-WEIGHTS    = ROOT / "models" / "lstm_letters.pt"
-LABELS     = ROOT / "models" / "label_encoder.npy"
+ROOT            = Path(__file__).parent.parent
+HAND_MODEL_PATH = ROOT / "data" / "hand_landmarker.task"
+POSE_MODEL_PATH = ROOT / "data" / "pose_landmarker.task"
+WEIGHTS         = ROOT / "models" / "lstm_letters.pt"
+LABELS          = ROOT / "models" / "label_encoder.npy"
 
 # ── Load model ────────────────────────────────────────────────────────────────
 class SignLSTM(nn.Module):
@@ -64,9 +58,9 @@ def load_model():
     return model, label_names, checkpoint["seq_len"]
 
 
-# ── MediaPipe detector (IMAGE mode for per-frame inference) ───────────────────
-def make_detector():
-    base_options = mp_python.BaseOptions(model_asset_path=str(MODEL_PATH))
+# ── MediaPipe detectors (IMAGE mode for per-frame inference) ──────────────────
+def make_hand_detector():
+    base_options = mp_python.BaseOptions(model_asset_path=str(HAND_MODEL_PATH))
     options = mp_vision.HandLandmarkerOptions(
         base_options=base_options,
         running_mode=mp_vision.RunningMode.IMAGE,
@@ -74,6 +68,17 @@ def make_detector():
         min_hand_detection_confidence=0.5,
     )
     return mp_vision.HandLandmarker.create_from_options(options)
+
+
+def make_pose_detector():
+    base_options = mp_python.BaseOptions(model_asset_path=str(POSE_MODEL_PATH))
+    options = mp_vision.PoseLandmarkerOptions(
+        base_options=base_options,
+        running_mode=mp_vision.RunningMode.IMAGE,
+        num_poses=1,
+        min_pose_detection_confidence=0.5,
+    )
+    return mp_vision.PoseLandmarker.create_from_options(options)
 
 
 # ── Inference on a rolling frame buffer ──────────────────────────────────────
@@ -140,7 +145,8 @@ def draw_skeleton(frame, pts):
 def main():
     print("Loading model ...")
     model, label_names, seq_len = load_model()
-    detector = make_detector()
+    hand_detector = make_hand_detector()
+    pose_detector = make_pose_detector()
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -160,23 +166,26 @@ def main():
 
         frame = cv2.flip(frame, 1)
 
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image  = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
-        result    = detector.detect(mp_image)
-        raw       = landmarks_from_result(result)
+        frame_rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image    = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+        hand_result = hand_detector.detect(mp_image)
+        pose_result = pose_detector.detect(mp_image)
+        hand_raw    = landmarks_from_result(hand_result)
+        pose_raw    = pose_landmarks_from_result(pose_result)
 
         pts = None
-        if raw is not None:
-            from utils import normalize_landmarks
-            normalized = normalize_landmarks(raw)
+        if hand_raw is not None and pose_raw is not None:
+            hand_vec   = normalize_landmarks(hand_raw)       # (63,)
+            arm_vec    = normalize_arm_landmarks(pose_raw)   # (18,)
+            normalized = np.concatenate([hand_vec, arm_vec]) # (81,)
             buffer.append(normalized)
             if len(buffer) > BUFFER_MAX:
                 buffer.pop(0)
 
             h, w = frame.shape[:2]
-            pts  = [(int(lm.x * w), int(lm.y * h)) for lm in result.hand_landmarks[0]]
+            pts  = [(int(lm.x * w), int(lm.y * h)) for lm in hand_result.hand_landmarks[0]]
         else:
-            # Hand lost — slowly drain the buffer so prediction fades out
+            # Hand or pose lost — slowly drain the buffer so prediction fades out
             if buffer:
                 buffer.pop(0)
 

@@ -28,7 +28,7 @@ MODELS_DIR.mkdir(exist_ok=True)
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 SEQ_LEN           = 20    # must match extract_landmarks.py
-SAMPLES_PER_CLASS = 300
+SAMPLES_PER_CLASS = 600
 EPOCHS            = 80
 BATCH_SIZE        = 64
 LR                = 1e-3
@@ -38,19 +38,26 @@ DROPOUT           = 0.3
 
 
 # ── Sequence augmentation ─────────────────────────────────────────────────────
+HAND_DIM = 63   # 21 landmarks × 3
+ARM_DIM  = 18   #  6 landmarks × 3
+
+
 def augment_sequence(seq: np.ndarray) -> np.ndarray:
     """
-    Augment a (SEQ_LEN, 63) landmark sequence.
+    Augment a (SEQ_LEN, HAND_DIM + ARM_DIM) landmark sequence.
 
     Spatial transforms (rotation, scale, flip) use the SAME random values
-    for every frame in the sequence — this preserves the motion pattern.
+    for every frame — this preserves the motion pattern.
+    The same transform is applied to both hand and arm parts so their
+    relative geometry stays consistent.
     Noise is applied per-frame to simulate natural hand tremor.
     Time warping resamples the sequence at a slightly non-uniform rate.
     """
-    seq = seq.copy()   # (SEQ_LEN, 63)
+    seq      = seq.copy()
+    feat_dim = seq.shape[1]   # 81 with arms, 63 hand-only
 
     # ── Shared spatial transforms (same for all frames) ───────────────────────
-    angle   = np.random.uniform(-25, 25) * np.pi / 180
+    angle    = np.random.uniform(-25, 25) * np.pi / 180
     cos_a, sin_a = np.cos(angle), np.sin(angle)
     rot = np.array([[cos_a, -sin_a, 0],
                     [sin_a,  cos_a, 0],
@@ -59,34 +66,57 @@ def augment_sequence(seq: np.ndarray) -> np.ndarray:
     scale = np.random.uniform(0.85, 1.15)
     flip  = np.random.rand() < 0.5
 
-    for t in range(SEQ_LEN):
-        pts = seq[t].reshape(21, 3)
+    # Shear matrix — simulates tilted camera / different signing angle
+    shear_x = np.random.uniform(-0.15, 0.15)
+    shear_y = np.random.uniform(-0.15, 0.15)
+    shear = np.array([[1,       shear_x, 0],
+                      [shear_y, 1,       0],
+                      [0,       0,       1]], dtype=np.float32)
+    transform = rot @ shear
 
-        pts  = pts @ rot.T
-        pts *= scale
+    # Random landmark dropout mask — same dropout pattern for the whole sequence
+    hand_mask = (np.random.rand(21) > 0.1).astype(np.float32)   # drop ~10% of hand pts
+    arm_mask  = (np.random.rand(6)  > 0.1).astype(np.float32)
+
+    for t in range(seq.shape[0]):
+        # ── Hand part (always present) ────────────────────────────────────────
+        hand = seq[t, :HAND_DIM].reshape(21, 3)
+        hand  = hand @ transform.T
+        hand *= scale
         if flip:
-            pts[:, 0] *= -1
+            hand[:, 0] *= -1
+        hand += np.random.normal(0, 0.02, hand.shape).astype(np.float32)
+        hand *= hand_mask[:, None]   # zero out dropped landmarks
+        seq[t, :HAND_DIM] = hand.flatten()
 
-        # Per-frame noise
-        pts += np.random.normal(0, 0.02, pts.shape).astype(np.float32)
-
-        seq[t] = pts.flatten()
+        # ── Arm part (present when feat_dim == 81) ────────────────────────────
+        if feat_dim > HAND_DIM:
+            arm  = seq[t, HAND_DIM:].reshape(-1, 3)
+            arm   = arm @ transform.T
+            arm  *= scale
+            if flip:
+                arm[:, 0] *= -1
+            arm += np.random.normal(0, 0.01, arm.shape).astype(np.float32)
+            arm *= arm_mask[:, None]
+            seq[t, HAND_DIM:] = arm.flatten()
 
     # ── Time warp ─────────────────────────────────────────────────────────────
-    # Resample the sequence at slightly uneven intervals, then snap back to SEQ_LEN
     warp_strength = np.random.uniform(0.8, 1.2)
-    t_orig  = np.linspace(0, 1, SEQ_LEN)
-    t_warped = np.linspace(0, 1, int(SEQ_LEN * warp_strength))
-    t_warped = np.clip(t_warped, 0, 1)
+    t_orig   = np.linspace(0, 1, seq.shape[0])
+    t_warped = np.clip(np.linspace(0, 1, int(seq.shape[0] * warp_strength)), 0, 1)
 
-    # Interpolate each feature dimension
-    warped = np.zeros((len(t_warped), 63), dtype=np.float32)
-    for dim in range(63):
+    warped = np.zeros((len(t_warped), feat_dim), dtype=np.float32)
+    for dim in range(feat_dim):
         warped[:, dim] = np.interp(t_warped, t_orig, seq[:, dim])
 
-    # Resample back to SEQ_LEN
-    indices = np.linspace(0, len(warped) - 1, SEQ_LEN, dtype=int)
+    indices = np.linspace(0, len(warped) - 1, seq.shape[0], dtype=int)
     return warped[indices]
+
+
+def mixup_sequences(seq_a: np.ndarray, seq_b: np.ndarray) -> np.ndarray:
+    """Interpolate between two sequences of the same class."""
+    lam = np.random.beta(0.4, 0.4)
+    return (lam * seq_a + (1 - lam) * seq_b).astype(np.float32)
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
@@ -103,10 +133,17 @@ class LetterSeqDataset(Dataset):
         return self.n_classes * self.samples_per_class
 
     def __getitem__(self, idx):
-        cls     = self.classes[idx % self.n_classes]
-        raw_idx = np.random.choice(self.class_indices[cls])
-        aug     = augment_sequence(self.X[raw_idx]).astype(np.float32)
-        return torch.from_numpy(aug), torch.tensor(int(cls), dtype=torch.long)
+        cls      = self.classes[idx % self.n_classes]
+        raw_idx  = np.random.choice(self.class_indices[cls])
+        aug      = augment_sequence(self.X[raw_idx])
+
+        # MixUp: 50% chance — blend with another sequence from the same class
+        if len(self.class_indices[cls]) > 1 and np.random.rand() < 0.5:
+            idx2 = np.random.choice(self.class_indices[cls])
+            aug2 = augment_sequence(self.X[idx2])
+            aug  = mixup_sequences(aug, aug2)
+
+        return torch.from_numpy(aug.astype(np.float32)), torch.tensor(int(cls), dtype=torch.long)
 
 
 # ── Model ─────────────────────────────────────────────────────────────────────
@@ -195,7 +232,8 @@ def main():
     train_dataset = LetterSeqDataset(X_train_raw, y_train, SAMPLES_PER_CLASS)
     train_loader  = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
 
-    model     = SignLSTM(63, LSTM_HIDDEN, LSTM_LAYERS, n_classes, DROPOUT).to(device)
+    input_dim = X_raw.shape[2]   # 81 with arm landmarks, 63 hand-only
+    model     = SignLSTM(input_dim, LSTM_HIDDEN, LSTM_LAYERS, n_classes, DROPOUT).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
@@ -221,11 +259,12 @@ def main():
 
     # Save
     model.load_state_dict(best_model_state)
+    input_dim = X_raw.shape[2]   # 81 with arm landmarks, 63 hand-only
     torch.save({
         "model_state": best_model_state,
         "lstm_hidden": LSTM_HIDDEN,
         "lstm_layers": LSTM_LAYERS,
-        "input_dim":   63,
+        "input_dim":   input_dim,
         "seq_len":     SEQ_LEN,
         "n_classes":   n_classes,
         "dropout":     DROPOUT,

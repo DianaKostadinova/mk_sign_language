@@ -13,13 +13,15 @@ from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 
 sys.path.append(str(Path(__file__).parent.parent))
-from utils import normalize_landmarks, landmarks_from_result
+from utils import (normalize_landmarks, landmarks_from_result,
+                   normalize_arm_landmarks, pose_landmarks_from_result)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-ROOT       = Path(__file__).parent.parent
-VIDEO_DIR  = ROOT / "videos" / "азбука"
-MODEL_PATH = ROOT / "data" / "hand_landmarker.task"
-OUTPUT_DIR = ROOT / "data" / "landmarks"
+ROOT            = Path(__file__).parent.parent
+VIDEO_DIR       = ROOT / "videos" / "азбука"
+HAND_MODEL_PATH = ROOT / "data" / "hand_landmarker.task"
+POSE_MODEL_PATH = ROOT / "data" / "pose_landmarker.task"
+OUTPUT_DIR      = ROOT / "data" / "landmarks"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # How many frames per sign sequence to save
@@ -32,12 +34,12 @@ WINDOW_END   = 0.80
 # Sliding-window extraction: number of sequences to pull per video
 SEQS_PER_VIDEO = 30
 # Step size between window starts (in detected-frame indices)
-WINDOW_STEP    = 3
+WINDOW_STEP    = 1
 
 
 # ── MediaPipe setup ───────────────────────────────────────────────────────────
-def make_detector():
-    base_options = mp_python.BaseOptions(model_asset_path=str(MODEL_PATH))
+def make_hand_detector():
+    base_options = mp_python.BaseOptions(model_asset_path=str(HAND_MODEL_PATH))
     options = mp_vision.HandLandmarkerOptions(
         base_options=base_options,
         num_hands=2,
@@ -48,13 +50,30 @@ def make_detector():
     return mp_vision.HandLandmarker.create_from_options(options)
 
 
+def make_pose_detector():
+    base_options = mp_python.BaseOptions(model_asset_path=str(POSE_MODEL_PATH))
+    options = mp_vision.PoseLandmarkerOptions(
+        base_options=base_options,
+        num_poses=1,
+        min_pose_detection_confidence=0.5,
+        min_pose_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    return mp_vision.PoseLandmarker.create_from_options(options)
+
+
 # ── Sequence extraction ───────────────────────────────────────────────────────
-def extract_all_sequences(video_path: Path, detector) -> list[np.ndarray]:
+def extract_all_sequences(video_path: Path,
+                          hand_detector,
+                          pose_detector) -> list[np.ndarray]:
     """
     Extract multiple fixed-length sequences from a single video using a
     sliding window over the detected frames.
 
-    Returns a list of (SEQ_LEN, 63) arrays; empty list if detection fails.
+    Each frame vector is hand landmarks (63) + arm landmarks (18) = 81 dims.
+    Frames where either detector fails are skipped.
+
+    Returns a list of (SEQ_LEN, 81) arrays; empty list if too few frames.
     """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -74,10 +93,17 @@ def extract_all_sequences(video_path: Path, detector) -> list[np.ndarray]:
             break
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image  = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
-        result    = detector.detect(mp_image)
-        raw       = landmarks_from_result(result)
-        if raw is not None:
-            detected_frames.append(normalize_landmarks(raw))
+
+        hand_result = hand_detector.detect(mp_image)
+        pose_result = pose_detector.detect(mp_image)
+
+        hand_raw = landmarks_from_result(hand_result)
+        pose_raw = pose_landmarks_from_result(pose_result)
+
+        if hand_raw is not None and pose_raw is not None:
+            hand_vec = normalize_landmarks(hand_raw)       # (63,)
+            arm_vec  = normalize_arm_landmarks(pose_raw)   # (18,)
+            detected_frames.append(np.concatenate([hand_vec, arm_vec]))  # (81,)
 
     cap.release()
 
@@ -108,14 +134,15 @@ def main():
 
     print(f"Found {len(letter_videos)} letter videos  |  SEQ_LEN={SEQ_LEN}\n")
 
-    detector  = make_detector()
-    sequences = []
-    labels    = []
-    failed    = []
+    hand_detector = make_hand_detector()
+    pose_detector = make_pose_detector()
+    sequences     = []
+    labels        = []
+    failed        = []
 
     for i, video_path in enumerate(letter_videos, 1):
         label = video_path.stem.split(" – ")[0].strip()
-        seqs = extract_all_sequences(video_path, detector)
+        seqs = extract_all_sequences(video_path, hand_detector, pose_detector)
         print(f"[{i:02d}/{len(letter_videos)}] {label}  → {len(seqs)} sequences")
         if seqs:
             sequences.extend(seqs)
