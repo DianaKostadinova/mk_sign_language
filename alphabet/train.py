@@ -5,7 +5,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
+    
 from pathlib import Path
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
@@ -43,20 +43,9 @@ ARM_DIM  = 18   #  6 landmarks × 3
 
 
 def augment_sequence(seq: np.ndarray) -> np.ndarray:
-    """
-    Augment a (SEQ_LEN, HAND_DIM + ARM_DIM) landmark sequence.
-
-    Spatial transforms (rotation, scale, flip) use the SAME random values
-    for every frame — this preserves the motion pattern.
-    The same transform is applied to both hand and arm parts so their
-    relative geometry stays consistent.
-    Noise is applied per-frame to simulate natural hand tremor.
-    Time warping resamples the sequence at a slightly non-uniform rate.
-    """
     seq      = seq.copy()
-    feat_dim = seq.shape[1]   # 81 with arms, 63 hand-only
+    T, feat_dim = seq.shape
 
-    # ── Shared spatial transforms (same for all frames) ───────────────────────
     angle    = np.random.uniform(-25, 25) * np.pi / 180
     cos_a, sin_a = np.cos(angle), np.sin(angle)
     rot = np.array([[cos_a, -sin_a, 0],
@@ -66,7 +55,6 @@ def augment_sequence(seq: np.ndarray) -> np.ndarray:
     scale = np.random.uniform(0.85, 1.15)
     flip  = np.random.rand() < 0.5
 
-    # Shear matrix — simulates tilted camera / different signing angle
     shear_x = np.random.uniform(-0.15, 0.15)
     shear_y = np.random.uniform(-0.15, 0.15)
     shear = np.array([[1,       shear_x, 0],
@@ -74,43 +62,42 @@ def augment_sequence(seq: np.ndarray) -> np.ndarray:
                       [0,       0,       1]], dtype=np.float32)
     transform = rot @ shear
 
-    # Random landmark dropout mask — same dropout pattern for the whole sequence
-    hand_mask = (np.random.rand(21) > 0.1).astype(np.float32)   # drop ~10% of hand pts
+    hand_mask = (np.random.rand(21) > 0.1).astype(np.float32)
     arm_mask  = (np.random.rand(6)  > 0.1).astype(np.float32)
 
-    for t in range(seq.shape[0]):
-        # ── Hand part (always present) ────────────────────────────────────────
-        hand = seq[t, :HAND_DIM].reshape(21, 3)
-        hand  = hand @ transform.T
-        hand *= scale
+    # ── Hand: all frames at once (T, 21, 3) ──────────────────────────────────
+    hand = seq[:, :HAND_DIM].reshape(T, 21, 3)
+    hand = hand @ transform.T
+    hand *= scale
+    if flip:
+        hand[:, :, 0] *= -1
+    hand += np.random.normal(0, 0.02, hand.shape).astype(np.float32)
+    hand *= hand_mask[None, :, None]
+    seq[:, :HAND_DIM] = hand.reshape(T, HAND_DIM)
+
+    # ── Arm: all frames at once ───────────────────────────────────────────────
+    if feat_dim > HAND_DIM:
+        n_arm = (feat_dim - HAND_DIM) // 3
+        arm = seq[:, HAND_DIM:].reshape(T, n_arm, 3)
+        arm = arm @ transform.T
+        arm *= scale
         if flip:
-            hand[:, 0] *= -1
-        hand += np.random.normal(0, 0.02, hand.shape).astype(np.float32)
-        hand *= hand_mask[:, None]   # zero out dropped landmarks
-        seq[t, :HAND_DIM] = hand.flatten()
+            arm[:, :, 0] *= -1
+        arm += np.random.normal(0, 0.01, arm.shape).astype(np.float32)
+        arm *= arm_mask[None, :, None]
+        seq[:, HAND_DIM:] = arm.reshape(T, feat_dim - HAND_DIM)
 
-        # ── Arm part (present when feat_dim == 81) ────────────────────────────
-        if feat_dim > HAND_DIM:
-            arm  = seq[t, HAND_DIM:].reshape(-1, 3)
-            arm   = arm @ transform.T
-            arm  *= scale
-            if flip:
-                arm[:, 0] *= -1
-            arm += np.random.normal(0, 0.01, arm.shape).astype(np.float32)
-            arm *= arm_mask[:, None]
-            seq[t, HAND_DIM:] = arm.flatten()
-
-    # ── Time warp ─────────────────────────────────────────────────────────────
+    # ── Time warp: vectorized linear interp, no per-dim loop ─────────────────
     warp_strength = np.random.uniform(0.8, 1.2)
-    t_orig   = np.linspace(0, 1, seq.shape[0])
-    t_warped = np.clip(np.linspace(0, 1, int(seq.shape[0] * warp_strength)), 0, 1)
+    n_warped = max(2, int(T * warp_strength))
+    t_src = np.clip(np.linspace(0, T - 1, n_warped), 0, T - 1)
+    lo    = np.floor(t_src).astype(int)
+    hi    = np.minimum(lo + 1, T - 1)
+    alpha = (t_src - lo)[:, None]                        # (n_warped, 1)
+    warped = seq[lo] * (1 - alpha) + seq[hi] * alpha    # (n_warped, feat_dim)
 
-    warped = np.zeros((len(t_warped), feat_dim), dtype=np.float32)
-    for dim in range(feat_dim):
-        warped[:, dim] = np.interp(t_warped, t_orig, seq[:, dim])
-
-    indices = np.linspace(0, len(warped) - 1, seq.shape[0], dtype=int)
-    return warped[indices]
+    indices = np.linspace(0, n_warped - 1, T, dtype=int)
+    return warped[indices].astype(np.float32)
 
 
 def mixup_sequences(seq_a: np.ndarray, seq_b: np.ndarray) -> np.ndarray:
@@ -213,6 +200,8 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}\n")
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
 
     # Stratified split — val samples are fully excluded from training
     X_train_raw, X_val_raw, y_train, y_val_raw = train_test_split(
@@ -230,7 +219,11 @@ def main():
     y_val = np.array(y_val_list, dtype=np.int64)
 
     train_dataset = LetterSeqDataset(X_train_raw, y_train, SAMPLES_PER_CLASS)
-    train_loader  = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    train_loader  = DataLoader(
+        train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+        num_workers=2, pin_memory=(device.type == "cuda"),
+        persistent_workers=True,
+    )
 
     input_dim = X_raw.shape[2]   # 81 with arm landmarks, 63 hand-only
     model     = SignLSTM(input_dim, LSTM_HIDDEN, LSTM_LAYERS, n_classes, DROPOUT).to(device)

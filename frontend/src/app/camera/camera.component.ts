@@ -1,4 +1,4 @@
-import { Component, computed, inject, OnDestroy } from '@angular/core';
+import  { Component, computed, inject, OnDestroy } from '@angular/core';
 import { DetectionService } from '../detection.service';
 
 @Component({
