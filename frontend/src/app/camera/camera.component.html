@@ -1,0 +1,62 @@
+<aside class="panel">
+  <header class="brand">
+    <span class="brand-dot" [class.active]="detection.connected()"></span>
+    <span class="brand-name" [class.active]="detection.connected()">МК Знак</span>
+  </header>
+
+  <div class="letter-area">
+    <div class="letter" [class.has-letter]="detection.letter() !== null">
+      {{ detection.letter() ?? '—' }}
+    </div>
+    <div class="confidence-label" [class.live]="detection.confidence() > 0">
+      {{ confidenceLabel() }}
+    </div>
+  </div>
+
+  <footer class="controls">
+    <div class="divider"></div>
+    <button
+      class="detect-btn"
+      [class.active]="detection.connected()"
+      (click)="toggle()"
+    >
+      <span class="detect-dot"></span>
+      <span>{{ detection.connected() ? 'stop detecting' : 'start detecting' }}</span>
+    </button>
+  </footer>
+</aside>
+
+<section class="feed">
+  <div class="feed-viewport">
+    <span class="corner tl" aria-hidden="true"></span>
+    <span class="corner tr" aria-hidden="true"></span>
+    <span class="corner bl" aria-hidden="true"></span>
+    <span class="corner br" aria-hidden="true"></span>
+
+    @if (detection.connected()) {
+      <img
+        [src]="detection.videoUrl"
+        class="stream"
+        alt="Live webcam feed"
+      />
+      <div class="scan-line" aria-hidden="true"></div>
+    } @else {
+      <div class="feed-idle">
+        <svg width="30" height="30" viewBox="0 0 24 24" fill="none"
+             stroke="currentColor" stroke-width="1.5" stroke-linecap="round"
+             aria-hidden="true">
+          <path d="M23 7 16 12 23 17V7z"/>
+          <rect x="1" y="5" width="15" height="14" rx="2"/>
+          <line x1="1" y1="1" x2="23" y2="23"/>
+        </svg>
+        <span>camera inactive</span>
+      </div>
+    }
+  </div>
+
+  <div class="feed-status">
+    <span class="status-dot" [class.live]="detection.connected()"></span>
+    <span class="status-label">{{ detection.connected() ? 'live' : 'standby' }}</span>
+    <span class="mode-tag">alphabet mode</span>
+  </div>
+</section>
