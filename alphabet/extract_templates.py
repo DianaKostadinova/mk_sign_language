@@ -13,9 +13,7 @@ from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 
 sys.path.append(str(Path(__file__).parent.parent))
-from utils import (normalize_landmarks, landmarks_from_result,
-                   normalize_arm_landmarks, pose_landmarks_from_result)
-from alphabet.dtw_common import frame_feature, make_template, TEMPLATE_LEN
+from alphabet.dtw_common import build_frame, make_template, TEMPLATE_LEN
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 ROOT            = Path(__file__).parent.parent
@@ -84,12 +82,10 @@ def extract_detected_frames(video_path: Path, hand_detector, pose_detector) -> n
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image  = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
 
-        hand_raw = landmarks_from_result(hand_detector.detect(mp_image))
-        pose_raw = pose_landmarks_from_result(pose_detector.detect(mp_image))
-
-        if hand_raw is not None and pose_raw is not None:
-            frames.append(frame_feature(normalize_landmarks(hand_raw),
-                                        normalize_arm_landmarks(pose_raw)))
+        feature, _ = build_frame(hand_detector.detect(mp_image),
+                                 pose_detector.detect(mp_image))
+        if feature is not None:
+            frames.append(feature)
 
     cap.release()
     return np.array(frames, dtype=np.float32)
