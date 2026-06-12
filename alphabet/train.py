@@ -203,10 +203,19 @@ def main():
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
 
-    # Stratified split — val samples are fully excluded from training
-    X_train_raw, X_val_raw, y_train, y_val_raw = train_test_split(
-        X_raw, y, test_size=0.15, stratify=y, random_state=42
-    )
+    # Per-class temporal split: last 15% of each class's sequences go to val.
+    # This avoids the random split scattering near-duplicate sliding-window
+    # sequences across both sides of the train/val boundary.
+    train_idx, val_idx = [], []
+    for cls in np.unique(y):
+        idx = np.where(y == cls)[0]
+        cut = max(1, int(len(idx) * 0.85))
+        train_idx.extend(idx[:cut])
+        val_idx.extend(idx[cut:])
+    train_idx = np.array(train_idx)
+    val_idx   = np.array(val_idx)
+    X_train_raw, y_train   = X_raw[train_idx], y[train_idx]
+    X_val_raw,   y_val_raw = X_raw[val_idx],   y[val_idx]
 
     # Augment the held-out val set once for a stable evaluation target
     VAL_AUG = 10

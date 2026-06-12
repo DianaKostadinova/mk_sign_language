@@ -33,8 +33,8 @@ WINDOW_END   = 0.80
 
 # Sliding-window extraction: number of sequences to pull per video
 SEQS_PER_VIDEO = 30
-# Step size between window starts (in detected-frame indices)
-WINDOW_STEP    = 1
+# Step size between window starts — must be >= SEQ_LEN for zero overlap
+WINDOW_STEP    = 7
 
 
 # ── MediaPipe setup ───────────────────────────────────────────────────────────
