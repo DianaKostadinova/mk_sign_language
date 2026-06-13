@@ -195,15 +195,20 @@ def main():
         print("Run extract_templates.py first.")
         return
 
-    data      = np.load(TEMPLATES_PATH, allow_pickle=True)
-    templates = data["templates"]
-    labels    = data["labels"]
+    # Once you've recorded your own takes, match against ONLY those — the
+    # reference videos are a different signer and don't transfer to a webcam.
     if USER_TEMPLATES.exists():
-        user = np.load(USER_TEMPLATES, allow_pickle=True)
-        templates = np.concatenate([templates, user["templates"]])
-        labels    = np.concatenate([labels, user["labels"]])
-        print(f"Loaded {len(user['labels'])} user takes (record_templates.py)")
-    print(f"Loaded {len(templates)} templates for {len(set(labels))} letters")
+        user      = np.load(USER_TEMPLATES, allow_pickle=True)
+        templates = user["templates"]
+        labels    = user["labels"]
+        print(f"Matching against YOUR {len(labels)} recorded takes "
+              f"({len(set(labels))} letters). Reference videos ignored.")
+    else:
+        data      = np.load(TEMPLATES_PATH, allow_pickle=True)
+        templates = data["templates"]
+        labels    = data["labels"]
+        print(f"Matching against {len(templates)} REFERENCE templates "
+              f"(different signer — expect poor webcam accuracy).")
 
     hand_detector = make_hand_detector()
     pose_detector = make_pose_detector()
