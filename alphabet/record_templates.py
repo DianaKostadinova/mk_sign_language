@@ -1,16 +1,18 @@
-
+    
 """
 Record your own webcam templates for the DTW matcher.
 
-The reference videos are a different signer, camera, and framing than your
-webcam — adding even one or two takes of yourself per letter usually improves
-live accuracy more than any tuning. Recorded takes are saved to
-data/landmarks/user_templates.npz and loaded automatically by dtw_demo.py.
+Fully automatic — no key presses needed to record:
+  • The current letter to record is shown big on screen.
+  • RAISE your hand into frame  -> a take starts recording.
+  • TAKE your hand out of frame  -> the take is saved.
+  • After TAKES_PER_LETTER takes, it auto-advances to the next letter.
 
-Controls:
-  SPACE  start / stop recording a take of the current letter
-  D      delete the takes recorded for the current letter (this session)
-  N / B  next / previous letter
+Recorded takes are saved to data/landmarks/user_templates.npz and loaded
+automatically by sequence_demo.py / dtw_demo.py.
+
+Keys (optional):
+  N / B  skip to next / previous letter      D  delete this letter's takes
   Q      save everything and quit
 """
 
@@ -36,7 +38,9 @@ POSE_MODEL_PATH = ROOT / "data" / "pose_landmarker.task"
 REF_TEMPLATES   = ROOT / "data" / "landmarks" / "dtw_templates.npz"
 USER_TEMPLATES  = ROOT / "data" / "landmarks" / "user_templates.npz"
 
-MIN_TAKE_FRAMES = 10
+MIN_TAKE_FRAMES  = 10
+TAKES_PER_LETTER = 3      # auto-advance after this many takes
+SAVE_GAP_S       = 0.6    # hand out of frame this long ends + saves a take
 
 
 def make_hand_detector():
@@ -109,19 +113,26 @@ def main():
         print("Could not open webcam.")
         return
 
+    import time
     idx          = 0
     recording    = False
     take_frames: list[np.ndarray] = []
     timestamp_ms = 0
+    absent_secs  = 0.0
+    last_t       = time.time()
     flash_msg, flash_until = "", 0.0
 
-    import time
-    print("SPACE record/stop · N next · B back · D delete letter takes · Q save+quit")
+    print("AUTO record: raise hand to record a take, take hand out to save it.")
+    print(f"{TAKES_PER_LETTER} takes per letter, then it advances. "
+          f"N skip · B back · D delete · Q save+quit")
 
     while True:
         ok, frame = cap.read()
         if not ok:
             break
+        now   = time.time()
+        dt    = now - last_t
+        last_t = now
         frame = cv2.flip(frame, 1)
         timestamp_ms += 33
 
@@ -129,40 +140,49 @@ def main():
         mp_image    = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
         feature, _ = build_frame(hand_detector.detect_for_video(mp_image, timestamp_ms),
                                  pose_detector.detect_for_video(mp_image, timestamp_ms))
-
         detected = feature is not None
-        if detected and recording:
-            take_frames.append(feature)
+        letter   = letters[idx]
 
-        letter = letters[idx]
+        def save_take():
+            nonlocal flash_msg, flash_until
+            if len(take_frames) >= MIN_TAKE_FRAMES:
+                user_templates.append(make_template(np.array(take_frames, np.float32)))
+                user_labels.append(letter)
+                flash_msg = f"saved take ({len(take_frames)} frames)"
+            else:
+                flash_msg = "too short, discarded"
+            flash_until = time.time() + 1.5
+
+        # ── Auto record state machine ────────────────────────────────────────
+        if detected:
+            absent_secs = 0.0
+            if not recording:
+                recording, take_frames = True, []
+            take_frames.append(feature)
+        elif recording:
+            absent_secs += dt
+            if absent_secs >= SAVE_GAP_S:
+                recording = False
+                save_take()
+                if user_labels.count(letter) >= TAKES_PER_LETTER:
+                    idx = (idx + 1) % len(letters)   # auto-advance
+
+        # ── Overlay ──────────────────────────────────────────────────────────
         n_takes = user_labels.count(letter)
-        texts = [(f"{letter}", (30, 10), 90,
-                  (255, 80, 80) if recording else (0, 255, 0)),
-                 (f"{idx + 1}/{len(letters)}   takes: {n_takes}", (30, 115), 26,
-                  (255, 255, 255))]
+        texts = [(f"{letter}", (30, 10), 90, (255, 80, 80) if recording else (0, 255, 0)),
+                 (f"letter {idx + 1}/{len(letters)}   takes {n_takes}/{TAKES_PER_LETTER}",
+                  (30, 115), 26, (255, 255, 255))]
         if recording:
             texts.append((f"● REC  {len(take_frames)} frames", (30, 150), 26, (255, 80, 80)))
-        elif not detected:
-            texts.append(("no hand detected", (30, 150), 26, (255, 0, 0)))
+        else:
+            texts.append(("raise hand to record", (30, 150), 26, (0, 200, 255)))
         if time.time() < flash_until:
             texts.append((flash_msg, (30, 185), 26, (0, 200, 255)))
         frame = draw_cyrillic(frame, texts)
 
         cv2.imshow("Record templates", frame)
         key = cv2.waitKey(1) & 0xFF
-
-        if key == ord(" "):
-            if not recording:
-                recording, take_frames = True, []
-            else:
-                recording = False
-                if len(take_frames) >= MIN_TAKE_FRAMES:
-                    user_templates.append(make_template(np.array(take_frames, np.float32)))
-                    user_labels.append(letter)
-                    flash_msg, flash_until = f"saved take ({len(take_frames)} frames)", time.time() + 2
-                else:
-                    flash_msg, flash_until = "too short, discarded", time.time() + 2
-        elif key == ord("n"):
+        if key == ord("n"):
             idx, recording = (idx + 1) % len(letters), False
         elif key == ord("b"):
             idx, recording = (idx - 1) % len(letters), False
@@ -170,7 +190,7 @@ def main():
             keep = [(t, l) for t, l in zip(user_templates, user_labels) if l != letter]
             user_templates = [t for t, _ in keep]
             user_labels    = [l for _, l in keep]
-            flash_msg, flash_until = f"deleted takes for {letter}", time.time() + 2
+            flash_msg, flash_until = f"deleted takes for {letter}", time.time() + 1.5
         elif key == ord("q"):
             break
 
