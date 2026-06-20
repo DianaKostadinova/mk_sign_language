@@ -2,9 +2,9 @@
 """
 Record your own webcam templates for the DTW matcher.
 
-Fully automatic — no key presses needed to record:
+Recording is triggered by the SPACE key:
   • The current letter to record is shown big on screen.
-  • RAISE your hand into frame  -> a take starts recording.
+  • Press SPACE                  -> a take starts recording (shown on screen).
   • TAKE your hand out of frame  -> the take is saved.
   • After TAKES_PER_LETTER takes, it auto-advances to the next letter.
 
@@ -122,7 +122,7 @@ def main():
     last_t       = time.time()
     flash_msg, flash_until = "", 0.0
 
-    print("AUTO record: raise hand to record a take, take hand out to save it.")
+    print("Press SPACE to start a take, take your hand out of frame to save it.")
     print(f"{TAKES_PER_LETTER} takes per letter, then it advances. "
           f"N skip · B back · D delete · Q save+quit")
 
@@ -153,19 +153,18 @@ def main():
                 flash_msg = "too short, discarded"
             flash_until = time.time() + 1.5
 
-        # ── Auto record state machine ────────────────────────────────────────
-        if detected:
-            absent_secs = 0.0
-            if not recording:
-                recording, take_frames = True, []
-            take_frames.append(feature)
-        elif recording:
-            absent_secs += dt
-            if absent_secs >= SAVE_GAP_S:
-                recording = False
-                save_take()
-                if user_labels.count(letter) >= TAKES_PER_LETTER:
-                    idx = (idx + 1) % len(letters)   # auto-advance
+        # ── Record state machine: SPACE arms recording, hand-out saves ───────
+        if recording:
+            if detected:
+                absent_secs = 0.0
+                take_frames.append(feature)
+            elif take_frames:                 # only after some frames captured,
+                absent_secs += dt             # so raising the hand late is fine
+                if absent_secs >= SAVE_GAP_S:
+                    recording = False
+                    save_take()
+                    if user_labels.count(letter) >= TAKES_PER_LETTER:
+                        idx = (idx + 1) % len(letters)   # auto-advance
 
         # ── Overlay ──────────────────────────────────────────────────────────
         n_takes = user_labels.count(letter)
@@ -173,16 +172,20 @@ def main():
                  (f"letter {idx + 1}/{len(letters)}   takes {n_takes}/{TAKES_PER_LETTER}",
                   (30, 115), 26, (255, 255, 255))]
         if recording:
-            texts.append((f"● REC  {len(take_frames)} frames", (30, 150), 26, (255, 80, 80)))
+            texts.append((f"● RECORDING  {len(take_frames)} frames  -  remove hand to finish",
+                          (30, 150), 26, (255, 80, 80)))
         else:
-            texts.append(("raise hand to record", (30, 150), 26, (0, 200, 255)))
+            texts.append(("press SPACE to start recording", (30, 150), 26, (0, 200, 255)))
         if time.time() < flash_until:
             texts.append((flash_msg, (30, 185), 26, (0, 200, 255)))
         frame = draw_cyrillic(frame, texts)
 
         cv2.imshow("Record templates", frame)
         key = cv2.waitKey(1) & 0xFF
-        if key == ord("n"):
+        if key == ord(" ") and not recording:
+            recording, take_frames, absent_secs = True, [], 0.0
+            flash_msg, flash_until = "recording started - remove hand to finish", time.time() + 2.0
+        elif key == ord("n"):
             idx, recording = (idx + 1) % len(letters), False
         elif key == ord("b"):
             idx, recording = (idx - 1) % len(letters), False
