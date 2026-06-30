@@ -42,8 +42,10 @@ SEED = 0
 random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 print("device:", DEVICE)
 
-# TODO: point these at the mounted dataset
-AUTSL_KEYPOINTS_DIR = "/kaggle/input/autsl-wholebody-keypoints"   # <-- EDIT
+# Point this at the SAM-SLR processed-skeleton folder (the Google Drive
+# release linked from jackyjsy/CVPR21Chal-SLR): contains
+# {train,test}_data_joint.npy + train_label.pkl + {train,test}_labels.csv.
+AUTSL_KEYPOINTS_DIR = "/kaggle/input/autsl-skeleton-sam-slr"   # <-- EDIT
 EMBED_DIM   = 256
 SEQ_LEN     = 32            # match alphabet TEMPLATE_LEN so features line up
 BATCH_SIGNS = 32            # P signs per batch
@@ -53,53 +55,57 @@ EPOCHS      = 40
 # %% [markdown]
 # ## 1. Keypoints -> shape features (parity with the DTW pipeline)
 #
-# Your live demo and Macedonian gallery use the features in
-# `alphabet/dtw_common.py`: per-hand joint angles + finger spreads +
-# normalised fingertip distances, plus arm features. For the embedding space
-# to be shared, AUTSL clips must be encoded with the **same** descriptor.
+# The released AUTSL skeleton data (SAM-SLR, `jackyjsy/CVPR21Chal-SLR`) is
+# **not** the raw 133 mmpose wholebody points — it's already reduced to a
+# 27-node graph: 7 body points (nose + shoulders/elbows/wrists) + 10 points
+# per hand (wrist/root, then base+tip per finger, thumb tip only). That's
+# fewer points than the 21-landmark MediaPipe hands `dtw_common._hand_shape`
+# expects, so it can't be byte-compatible with the full descriptor.
 #
-# The mmpose wholebody layout has 133 keypoints: body + 21 left-hand + 21
-# right-hand. Map those hand keypoints to the 21-landmark order MediaPipe
-# uses, then call the exact same feature code.
+# Instead both sides go through `dtw_common._hand_shape_coarse10`, a
+# 10-point descriptor designed to match what AUTSL actually has.
+# `COARSE10_FROM_MP21` picks the same 10 points out of Macedonian's full
+# 21-point MediaPipe hands so the two sides share one embedding space —
+# see `alphabet/dtw_common.py`.
 
 # %%
 # Reuse the real feature functions so AUTSL and Macedonian are byte-compatible.
 # On Kaggle/Colab, upload alphabet/dtw_common.py alongside this notebook.
 import sys; sys.path.append(".")
 try:
-    from dtw_common import _hand_shape, _arm_feat, HAND_SHAPE_DIM, make_template
+    from dtw_common import _hand_shape_coarse10, _arm_feat, COARSE_HAND_DIM, ARM_WEIGHT, make_template
 except ImportError:
     raise SystemExit("Upload alphabet/dtw_common.py next to this notebook first.")
 
-# mmpose wholebody -> MediaPipe-21 index maps. VERIFY against your keypoint
-# file's documented joint order before trusting these.
-# TODO: confirm these indices for your specific keypoint export.
-WB_LEFT_HAND  = list(range(91, 112))    # 21 left-hand keypoints
-WB_RIGHT_HAND = list(range(112, 133))   # 21 right-hand keypoints
-WB_POSE_FOR_ARM = {                     # body joints used by _arm_feat
-    "l_shoulder": 5, "r_shoulder": 6, "l_elbow": 7, "r_elbow": 8,
-    "l_wrist": 9,    "r_wrist": 10,
-}
+# 27-node layout produced by SAM-SLR's data-prepare (see
+# CVPR21Chal-SLR/SL-GCN/data_gen/sign_gendata.py, the '27' config):
+#   node 0           : nose
+#   nodes 1,2 / 3,4 / 5,6 : l/r shoulder, l/r elbow, l/r wrist
+#   nodes 7-16        : left hand  (root, thumb_tip, idx_base,idx_tip,
+#                                    mid_base,mid_tip, ring_base,ring_tip,
+#                                    pinky_base,pinky_tip)
+#   nodes 17-26       : right hand, same order
+WB27_LEFT_HAND  = list(range(7, 17))
+WB27_RIGHT_HAND = list(range(17, 27))
+WB27_POSE = {"l_shoulder": 1, "r_shoulder": 2, "l_elbow": 3,
+             "r_elbow": 4,    "l_wrist": 5,    "r_wrist": 6}
 
-def frame_feature(wb_xy: np.ndarray) -> np.ndarray | None:
-    """One wholebody frame (133,2) -> POS_DIM feature, matching dtw_common."""
-    # Build a MediaPipe-style 33-pose stub holding just the joints _arm_feat
-    # needs at indices 11,12,13,14,15,16 (shoulders/elbows/wrists).
+def frame_feature(node_xy: np.ndarray) -> np.ndarray | None:
+    """One 27-node frame (27,2) -> (2*COARSE_HAND_DIM + ARM_FEAT_DIM,) feature."""
     pose = np.zeros((33, 3), np.float32)
-    m = WB_POSE_FOR_ARM
-    pose[11, :2], pose[12, :2] = wb_xy[m["l_shoulder"]], wb_xy[m["r_shoulder"]]
-    pose[13, :2], pose[14, :2] = wb_xy[m["l_elbow"]],    wb_xy[m["r_elbow"]]
-    pose[15, :2], pose[16, :2] = wb_xy[m["l_wrist"]],    wb_xy[m["r_wrist"]]
+    m = WB27_POSE
+    pose[11, :2], pose[12, :2] = node_xy[m["l_shoulder"]], node_xy[m["r_shoulder"]]
+    pose[13, :2], pose[14, :2] = node_xy[m["l_elbow"]],    node_xy[m["r_elbow"]]
+    pose[15, :2], pose[16, :2] = node_xy[m["l_wrist"]],    node_xy[m["r_wrist"]]
 
-    lh, rh = wb_xy[WB_LEFT_HAND], wb_xy[WB_RIGHT_HAND]
+    lh, rh = node_xy[WB27_LEFT_HAND], node_xy[WB27_RIGHT_HAND]
     def hs(h):
-        return _hand_shape(h) if np.any(h) else np.zeros(HAND_SHAPE_DIM, np.float32)
-    from dtw_common import ARM_WEIGHT
+        return _hand_shape_coarse10(h) if np.any(h) else np.zeros(COARSE_HAND_DIM, np.float32)
     return np.concatenate([hs(lh), hs(rh), _arm_feat(pose) * ARM_WEIGHT]).astype(np.float32)
 
 def clip_to_template(seq_xy: np.ndarray) -> np.ndarray:
-    """(T,133,2) keypoint clip -> (SEQ_LEN, POS_DIM*2) template (smoothed,
-    resampled, +velocity) — identical representation to the Macedonian side."""
+    """(T,27,2) keypoint clip -> (SEQ_LEN, feat_dim*2) template (smoothed,
+    resampled, +velocity) — same coarse representation as the Macedonian side."""
     frames = [frame_feature(f) for f in seq_xy]
     frames = np.array([f for f in frames if f is not None], np.float32)
     return make_template(frames)            # uses TEMPLATE_LEN==SEQ_LEN
@@ -112,30 +118,45 @@ def clip_to_template(seq_xy: np.ndarray) -> np.ndarray:
 # K clips drawn from DIFFERENT signers. Held-out signers go to validation.
 
 # %%
+import pickle, re
+
 class AUTSLClips(Dataset):
-    """TODO: implement load_index() for your keypoint files. Each item must
-    expose (clip_xy[T,133,2], sign_id, signer_id)."""
-    def __init__(self, split="train", val_signers=(40, 41, 42)):
-        self.items = self.load_index(AUTSL_KEYPOINTS_DIR)   # [(path, sign, signer)]
-        keep = (lambda s: s not in val_signers) if split == "train" else (lambda s: s in val_signers)
-        self.items = [it for it in self.items if keep(it[2])]
+    """Reads the SAM-SLR processed-skeleton release directly:
+    {train,test}_data_joint.npy ((N,3,T,27,1): x,y,conf x frames x 27 nodes)
+    + {train,test}_label.pkl ((names, labels), row-aligned with the npy).
+
+    AUTSL's official train/test split is already signer-disjoint, so "val"
+    here just maps to the test split — that IS the held-out-signer set, no
+    extra carving needed."""
+    def __init__(self, split="train"):
+        file_split = "train" if split == "train" else "test"
+        root = Path(AUTSL_KEYPOINTS_DIR)
+        # mmap: data_joint.npy is multiple GB, don't load it into RAM.
+        self.data = np.load(root / f"{file_split}_data_joint.npy", mmap_mode="r")
+        with open(root / f"{file_split}_label.pkl", "rb") as f:
+            names, labels = pickle.load(f)
+        self.names  = list(names)
+        self.labels = list(labels)
+        self.signers = [self._signer_of(n) for n in self.names]
+        assert len(self.names) == self.data.shape[0], "label/data row count mismatch"
+
         self.by_sign = {}
-        for i, (_, sign, _) in enumerate(self.items):
-            self.by_sign.setdefault(sign, []).append(i)
+        for i, s in enumerate(self.labels):
+            self.by_sign.setdefault(s, []).append(i)
         self.signs = list(self.by_sign)
 
-    def load_index(self, root):
-        raise NotImplementedError(
-            "Read your keypoint manifest and return [(path, sign_id, signer_id), ...]")
+    @staticmethod
+    def _signer_of(name: str) -> int:
+        """AUTSL sample names look like 'signer23_sample412...' — pull the id."""
+        m = re.search(r"signer(\d+)", name, re.IGNORECASE)
+        return int(m.group(1)) if m else -1
 
-    def load_clip(self, path) -> np.ndarray:
-        raise NotImplementedError("Load (T,133,2) keypoints from `path`.")
-
-    def __len__(self): return len(self.items)
+    def __len__(self): return len(self.names)
 
     def __getitem__(self, i):
-        path, sign, signer = self.items[i]
-        return clip_to_template(self.load_clip(path)), sign, signer
+        row = np.asarray(self.data[i])               # (3, T, 27, 1)
+        xy  = np.transpose(row[:2, :, :, 0], (1, 2, 0))  # (T, 27, 2), drop confidence
+        return clip_to_template(xy), self.labels[i], self.signers[i]
 
 class PKSampler(torch.utils.data.Sampler):
     """Yield batches of P signs x K clips (varied signers) for contrastive loss."""
@@ -240,14 +261,24 @@ def evaluate_heldout(model, val_ds, gallery_per_sign=1):
 # %% [markdown]
 # ## 6. Use it on Macedonian — embed the gallery, then kNN
 #
+# IMPORTANT: `data/landmarks/word_templates.npz` (from
+# `words/extract_word_templates.py`) is featurized with the FULL 21-point
+# `_hand_shape` descriptor (POS_DIM=68) — wrong dimension for this encoder,
+# which only ever sees the 10-point coarse descriptor (parity with AUTSL's
+# reduced skeleton). Before this step, re-run word extraction using
+# `dtw_common.build_frame_coarse` in place of `build_frame` to produce a
+# `word_templates_coarse.npz` (same video set, coarse features) — that's
+# the file this function actually needs. Not done yet: it's pointless until
+# the encoder is trained, so do it as the step right before this one.
+#
 # Locally (back on your laptop), load the trained encoder, embed your 2500
-# `word_templates.npz` templates ONCE -> the dictionary. At inference, your
-# existing segmentation produces a clip -> template -> encoder -> nearest
-# neighbour. DTW is replaced by cosine distance; everything else is unchanged.
+# coarse-feature templates ONCE -> the dictionary. At inference, your
+# existing segmentation produces a clip -> coarse template -> encoder ->
+# nearest neighbour. DTW is replaced by cosine distance.
 
 # %%
 def build_macedonian_gallery(encoder_path="sign_encoder.pt",
-                             templates_npz="data/landmarks/word_templates.npz",
+                             templates_npz="data/landmarks/word_templates_coarse.npz",
                              out="data/landmarks/word_embeddings.npz"):
     d = np.load(templates_npz, allow_pickle=True)
     templ = torch.tensor(d["templates"])            # (K, SEQ_LEN, POS_DIM*2)

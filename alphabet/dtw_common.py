@@ -88,6 +88,46 @@ def _hand_shape(p: np.ndarray) -> np.ndarray:
     return np.array(angles + spreads + dists, dtype=np.float32)
 
 
+# ── Coarse 10-point hand descriptor ───────────────────────────────────────────
+# AUTSL's released skeleton data only keeps 10 of the 21 MediaPipe hand points
+# (wrist + base/tip per finger, thumb tip only — see notebooks/encoder_training.py).
+# To train an encoder on AUTSL and apply it to Macedonian templates in the SAME
+# embedding space, both sides must run through this same coarse descriptor —
+# COARSE10_FROM_MP21 picks the matching 10 points out of a full 21-point
+# MediaPipe hand so the Macedonian side can be downsampled to parity.
+COARSE10_FROM_MP21 = [0, 4, 5, 8, 9, 12, 13, 16, 17, 20]
+# Local layout after the subset above: 0 wrist, 1 thumb_tip,
+# 2 index_base, 3 index_tip, 4 middle_base, 5 middle_tip,
+# 6 ring_base, 7 ring_tip, 8 pinky_base, 9 pinky_tip.
+COARSE_HAND_DIM = 20   # 4 base angles + 4 spreads + 12 distances
+
+_COARSE_TRIPLETS  = [(0, 2, 3), (0, 4, 5), (0, 6, 7), (0, 8, 9)]   # index/middle/ring/pinky curl proxy
+_COARSE_FINGER_DIR = [(0, 1), (2, 3), (4, 5), (6, 7), (8, 9)]       # thumb uses wrist->tip (no base)
+_COARSE_SPREAD     = [(0, 1), (1, 2), (2, 3), (3, 4)]
+_COARSE_DIST_PAIRS = [(1, 3), (1, 5), (1, 7), (1, 9),
+                      (3, 5), (5, 7), (7, 9),
+                      (0, 1), (0, 3), (0, 5), (0, 7), (0, 9)]
+
+
+def _hand_shape_coarse10(p: np.ndarray) -> np.ndarray:
+    """(10, 2) coarse hand points (see COARSE10_FROM_MP21) -> (COARSE_HAND_DIM,)."""
+    angles = [_cos_at(p, a, b, c) for a, b, c in _COARSE_TRIPLETS]
+
+    dirs = [p[t] - p[m] for m, t in _COARSE_FINGER_DIR]
+    spreads = []
+    for i, j in _COARSE_SPREAD:
+        n1, n2 = np.linalg.norm(dirs[i]), np.linalg.norm(dirs[j])
+        spreads.append(0.0 if n1 < 1e-6 or n2 < 1e-6
+                       else float(np.clip(np.dot(dirs[i], dirs[j]) / (n1 * n2), -1.0, 1.0)))
+
+    scale = np.linalg.norm(p[0] - p[4])          # wrist -> middle_base
+    if scale < 1e-6:
+        scale = 1.0
+    dists = [float(np.linalg.norm(p[a] - p[b]) / scale) for a, b in _COARSE_DIST_PAIRS]
+
+    return np.array(angles + spreads + dists, dtype=np.float32)
+
+
 def _arm_feat(pose: np.ndarray) -> np.ndarray:
     """(33, 3) pose -> (ARM_FEAT_DIM,): elbow angles + wrist positions relative
     to shoulder midpoint, normalized by shoulder width (so body-size invariant)."""
@@ -135,6 +175,44 @@ def build_frame(hand_result, pose_result) -> tuple[np.ndarray | None, np.ndarray
 
     def hs(h):
         return _hand_shape(h) if h is not None else np.zeros(HAND_SHAPE_DIM, dtype=np.float32)
+
+    feature  = np.concatenate([hs(slot0), hs(slot1), _arm_feat(pose_raw) * ARM_WEIGHT])
+    wrist_xy = np.mean([h[0] for h in hands], axis=0)
+    return feature.astype(np.float32), wrist_xy
+
+
+COARSE_POS_DIM = 2 * COARSE_HAND_DIM + ARM_FEAT_DIM   # parity with notebooks/encoder_training.py
+
+
+def build_frame_coarse(hand_result, pose_result) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Same as build_frame, but downsamples each hand to the 10-point
+    COARSE10_FROM_MP21 subset before featurizing — for the AUTSL-encoder
+    pathway only, where the embedding space must match the 10-point
+    descriptor AUTSL's released skeleton data provides (see
+    notebooks/encoder_training.py). The DTW production pipeline keeps using
+    the full 21-point build_frame; only the encoder/gallery path uses this."""
+    pose_raw = pose_landmarks_from_result(pose_result)
+    if pose_raw is None or not hand_result.hand_landmarks:
+        return None, None
+
+    hands = [np.array([[lm.x, lm.y] for lm in h], dtype=np.float32)
+             for h in hand_result.hand_landmarks[:2]]
+
+    slot0 = slot1 = None
+    if len(hands) == 2:
+        hands.sort(key=lambda h: float(h[0, 0]))
+        slot0, slot1 = hands
+    else:
+        mid_x = float(pose_raw[11, 0] + pose_raw[12, 0]) / 2
+        if float(hands[0][0, 0]) < mid_x:
+            slot0 = hands[0]
+        else:
+            slot1 = hands[0]
+
+    def hs(h):
+        if h is None:
+            return np.zeros(COARSE_HAND_DIM, dtype=np.float32)
+        return _hand_shape_coarse10(h[COARSE10_FROM_MP21])
 
     feature  = np.concatenate([hs(slot0), hs(slot1), _arm_feat(pose_raw) * ARM_WEIGHT])
     wrist_xy = np.mean([h[0] for h in hands], axis=0)
