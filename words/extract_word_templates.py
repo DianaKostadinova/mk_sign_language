@@ -60,37 +60,62 @@ def main():
     if not videos:
         print(f"No word videos found under {VIDEO_ROOT}")
         return
-    print(f"Found {len(videos)} word videos. Extracting templates...\n")
+    print(f"Found {len(videos)} word videos.", flush=True)
+
+    # vid_id is the video's index in the full sorted list — stable across runs,
+    # so resuming keeps the same grouping the evaluator relies on.
+    full_index = {str(vp): i for i, vp in enumerate(find_word_videos())}
+
+    # Resume: load any existing cache and skip videos already processed (by path).
+    templates, labels, vid_ids, trim_ids, topics, paths = [], [], [], [], [], []
+    done_paths: set[str] = set()
+    if OUT_PATH.exists():
+        prev = np.load(OUT_PATH, allow_pickle=True)
+        if "paths" in prev:                       # only resume from a v2 cache
+            templates = list(prev["templates"]); labels  = list(prev["labels"])
+            vid_ids   = list(prev["vid_ids"]);   trim_ids = list(prev["trim_ids"])
+            topics    = list(prev["topics"]);    paths    = list(prev["paths"])
+            done_paths = set(str(p) for p in paths)
+            print(f"Resuming: {len(done_paths)} videos already done.", flush=True)
+
+    def checkpoint():
+        if not templates:
+            return
+        OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(OUT_PATH,
+                 templates=np.stack(templates).astype(np.float32),
+                 labels=np.array(labels),
+                 vid_ids=np.array(vid_ids, dtype=np.int32),
+                 trim_ids=np.array(trim_ids, dtype=np.int32),
+                 topics=np.array(topics),
+                 paths=np.array(paths))
 
     hand_detector = make_hand_detector()
     pose_detector = make_pose_detector()
 
-    templates, labels, vid_ids, trim_ids, topics = [], [], [], [], []
-    failed = []
-    for i, vp in enumerate(videos):
-        label  = vp.stem.strip()
-        topic  = vp.parent.name
+    failed, processed = [], 0
+    todo = [vp for vp in videos if str(vp) not in done_paths]
+    print(f"{len(todo)} videos left to process.\n", flush=True)
+    for vp in todo:
+        label, topic, vid = vp.stem.strip(), vp.parent.name, full_index[str(vp)]
         frames = extract_detected_frames(vp, hand_detector, pose_detector)
         tmpls  = templates_from_frames(frames) if len(frames) >= MIN_FRAMES else []
         if not tmpls:
             failed.append(label)
         for k, t in enumerate(tmpls):
-            templates.append(t); labels.append(label)
-            vid_ids.append(i);   trim_ids.append(k); topics.append(topic)
-        if (i + 1) % 50 == 0 or i + 1 == len(videos):
-            print(f"  [{i+1:>4}/{len(videos)}] {len(templates)} templates so far")
+            templates.append(t); labels.append(label); vid_ids.append(vid)
+            trim_ids.append(k);  topics.append(topic); paths.append(str(vp))
+        processed += 1
+        if processed % 50 == 0 or processed == len(todo):
+            checkpoint()                          # crash-safe periodic save
+            print(f"  [{processed:>4}/{len(todo)}] "
+                  f"{len(set(vid_ids))} videos, {len(templates)} templates "
+                  f"(checkpointed)", flush=True)
 
+    checkpoint()
     if not templates:
         print("No templates extracted.")
         return
-
-    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(OUT_PATH,
-             templates=np.stack(templates).astype(np.float32),
-             labels=np.array(labels),
-             vid_ids=np.array(vid_ids, dtype=np.int32),
-             trim_ids=np.array(trim_ids, dtype=np.int32),
-             topics=np.array(topics))
     print(f"\nSaved {len(templates)} templates from "
           f"{len(set(vid_ids))} videos → {OUT_PATH}")
     if failed:
