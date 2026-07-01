@@ -248,7 +248,9 @@ def collate(batch):
     return (torch.tensor(np.stack(xs)),
             torch.tensor(signs), torch.tensor(signers))
 
-def run_training():
+CKPT_PATH = "/content/drive/MyDrive/autsl/sign_encoder_ckpt.pt"   # <-- EDIT: survives a dropped Colab session
+
+def run_training(ckpt_path: str = CKPT_PATH):
     train_ds = AUTSLClips("train")
     val_ds   = AUTSLClips("val")
     in_dim   = train_ds[0][0].shape[-1]            # POS_DIM*2
@@ -258,9 +260,16 @@ def run_training():
     opt   = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, EPOCHS)
 
+    start_epoch = 0
+    if ckpt_path and Path(ckpt_path).exists():
+        ckpt = torch.load(ckpt_path, map_location=DEVICE)
+        model.load_state_dict(ckpt["model"]); opt.load_state_dict(ckpt["opt"])
+        sched.load_state_dict(ckpt["sched"]); start_epoch = ckpt["epoch"] + 1
+        print(f"resumed from checkpoint at epoch {start_epoch}", flush=True)
+
     print(f"train samples={len(train_ds)}  val samples={len(val_ds)}  "
           f"batches/epoch={len(train_ld)}", flush=True)
-    for epoch in range(EPOCHS):
+    for epoch in range(start_epoch, EPOCHS):
         model.train()
         for b, (x, signs, _) in enumerate(train_ld):
             x = x.to(DEVICE)
@@ -272,6 +281,10 @@ def run_training():
         sched.step()
         acc = evaluate_heldout(model, val_ds)       # real invariance signal
         print(f"epoch {epoch:02d}  loss {loss.item():.3f}  held-out top-1 {acc:.1%}", flush=True)
+        if ckpt_path:                                # so a dropped connection costs <=1 epoch, not the whole run
+            Path(ckpt_path).parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
+                        "sched": sched.state_dict(), "epoch": epoch}, ckpt_path)
     return model
 
 @torch.no_grad()
