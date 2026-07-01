@@ -45,7 +45,7 @@ print("device:", DEVICE)
 # Point this at the SAM-SLR processed-skeleton folder (the Google Drive
 # release linked from jackyjsy/CVPR21Chal-SLR): contains
 # {train,test}_data_joint.npy + train_label.pkl + {train,test}_labels.csv.
-AUTSL_KEYPOINTS_DIR = "/kaggle/input/autsl-skeleton-sam-slr"   # <-- EDIT
+AUTSL_KEYPOINTS_DIR = "/content/autsl_skeleton"   # <-- EDIT if running on Kaggle instead of Colab
 EMBED_DIM   = 256
 SEQ_LEN     = 32            # match alphabet TEMPLATE_LEN so features line up
 BATCH_SIGNS = 32            # P signs per batch
@@ -141,6 +141,7 @@ class AUTSLClips(Dataset):
         self.labels = labels
         self.signers = [self._signer_of(n) for n in self.names]
         assert len(self.names) == self.data.shape[0], "label/data row count mismatch"
+        self._cache: dict[int, np.ndarray] = {}
 
         self.by_sign = {}
         for i, s in enumerate(self.labels):
@@ -172,9 +173,19 @@ class AUTSLClips(Dataset):
     def __len__(self): return len(self.names)
 
     def __getitem__(self, i):
+        # Cache: a sample's template is deterministic, but PKSampler re-draws
+        # the same indices across all 400 batches x 40 epochs — without this,
+        # clip_to_template (pure-Python/numpy, no GPU) reruns from scratch
+        # every single time, which is the actual reason a "silent" epoch can
+        # take a very long time.
+        cached = self._cache.get(i)
+        if cached is not None:
+            return cached, self.labels[i], self.signers[i]
         row = np.asarray(self.data[i])               # (3, T, 27, 1)
         xy  = np.transpose(row[:2, :, :, 0], (1, 2, 0))  # (T, 27, 2), drop confidence
-        return clip_to_template(xy), self.labels[i], self.signers[i]
+        tmpl = clip_to_template(xy)
+        self._cache[i] = tmpl
+        return tmpl, self.labels[i], self.signers[i]
 
 class PKSampler(torch.utils.data.Sampler):
     """Yield batches of P signs x K clips (varied signers) for contrastive loss."""
@@ -247,15 +258,20 @@ def run_training():
     opt   = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, EPOCHS)
 
+    print(f"train samples={len(train_ds)}  val samples={len(val_ds)}  "
+          f"batches/epoch={len(train_ld)}", flush=True)
     for epoch in range(EPOCHS):
         model.train()
-        for x, signs, _ in train_ld:
+        for b, (x, signs, _) in enumerate(train_ld):
             x = x.to(DEVICE)
             loss = supcon_loss(model(x), signs.to(DEVICE))
             opt.zero_grad(); loss.backward(); opt.step()
+            if (b + 1) % 20 == 0:                    # first-epoch feature caching is slow; show it's alive
+                print(f"  epoch {epoch:02d}  batch {b+1}/{len(train_ld)}  "
+                      f"loss {loss.item():.3f}", flush=True)
         sched.step()
         acc = evaluate_heldout(model, val_ds)       # real invariance signal
-        print(f"epoch {epoch:02d}  loss {loss.item():.3f}  held-out top-1 {acc:.1%}")
+        print(f"epoch {epoch:02d}  loss {loss.item():.3f}  held-out top-1 {acc:.1%}", flush=True)
     return model
 
 @torch.no_grad()
