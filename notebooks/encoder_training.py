@@ -118,12 +118,15 @@ def clip_to_template(seq_xy: np.ndarray) -> np.ndarray:
 # K clips drawn from DIFFERENT signers. Held-out signers go to validation.
 
 # %%
-import pickle, re
+import pickle, re, csv
+from pathlib import Path
 
 class AUTSLClips(Dataset):
     """Reads the SAM-SLR processed-skeleton release directly:
     {train,test}_data_joint.npy ((N,3,T,27,1): x,y,conf x frames x 27 nodes)
-    + {train,test}_label.pkl ((names, labels), row-aligned with the npy).
+    + names/labels, row-aligned with the npy — from *_label.pkl where it
+    exists (train), else *_labels.csv (test: 'sample_name,label' rows, no
+    header assumed — verify against your actual file before trusting this).
 
     AUTSL's official train/test split is already signer-disjoint, so "val"
     here just maps to the test split — that IS the held-out-signer set, no
@@ -133,10 +136,9 @@ class AUTSLClips(Dataset):
         root = Path(AUTSL_KEYPOINTS_DIR)
         # mmap: data_joint.npy is multiple GB, don't load it into RAM.
         self.data = np.load(root / f"{file_split}_data_joint.npy", mmap_mode="r")
-        with open(root / f"{file_split}_label.pkl", "rb") as f:
-            names, labels = pickle.load(f)
-        self.names  = list(names)
-        self.labels = list(labels)
+        names, labels = self._load_labels(root, file_split)
+        self.names  = names
+        self.labels = labels
         self.signers = [self._signer_of(n) for n in self.names]
         assert len(self.names) == self.data.shape[0], "label/data row count mismatch"
 
@@ -150,6 +152,22 @@ class AUTSLClips(Dataset):
         """AUTSL sample names look like 'signer23_sample412...' — pull the id."""
         m = re.search(r"signer(\d+)", name, re.IGNORECASE)
         return int(m.group(1)) if m else -1
+
+    @staticmethod
+    def _load_labels(root: Path, file_split: str):
+        pkl_path = root / f"{file_split}_label.pkl"
+        if pkl_path.exists():
+            with open(pkl_path, "rb") as f:
+                names, labels = pickle.load(f)
+            return list(names), list(labels)
+        csv_path = root / f"{file_split}_labels.csv"
+        names, labels = [], []
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            for row in csv.reader(f):
+                if len(row) < 2 or not row[1].strip().lstrip("-").isdigit():
+                    continue                       # skip a header row if present
+                names.append(row[0]); labels.append(int(row[1]))
+        return names, labels
 
     def __len__(self): return len(self.names)
 
