@@ -13,7 +13,7 @@ from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 
 sys.path.append(str(Path(__file__).parent.parent))
-from alphabet.dtw_common import build_frame, make_template, TEMPLATE_LEN
+from alphabet.dtw_common import build_frame, build_frame_coarse, make_template, TEMPLATE_LEN
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 ROOT            = Path(__file__).parent.parent
@@ -62,8 +62,14 @@ def make_pose_detector():
 
 
 # ── Per-video extraction ──────────────────────────────────────────────────────
-def extract_detected_frames(video_path: Path, hand_detector, pose_detector) -> np.ndarray:
-    """All detected position-feature frames in the middle window. (T, POS_DIM)"""
+def extract_detected_frames(video_path: Path, hand_detector, pose_detector,
+                            coarse: bool = False) -> np.ndarray:
+    """All detected position-feature frames in the middle window. (T, POS_DIM)
+
+    coarse=True uses build_frame_coarse (10-point-per-hand descriptor) instead
+    of the full 21-point build_frame — only for feeding the AUTSL-trained
+    encoder, which was trained on that coarser parity descriptor. The DTW
+    production pipeline always uses coarse=False (the default)."""
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         print(f"  [WARN] Could not open {video_path.name}")
@@ -74,6 +80,7 @@ def extract_detected_frames(video_path: Path, hand_detector, pose_detector) -> n
     end_frame    = int(total_frames * WINDOW_END)
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
+    build = build_frame_coarse if coarse else build_frame
     frames = []
     for _ in range(end_frame - start_frame):
         ok, frame = cap.read()
@@ -82,8 +89,8 @@ def extract_detected_frames(video_path: Path, hand_detector, pose_detector) -> n
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image  = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
 
-        feature, _ = build_frame(hand_detector.detect(mp_image),
-                                 pose_detector.detect(mp_image))
+        feature, _ = build(hand_detector.detect(mp_image),
+                           pose_detector.detect(mp_image))
         if feature is not None:
             frames.append(feature)
 
