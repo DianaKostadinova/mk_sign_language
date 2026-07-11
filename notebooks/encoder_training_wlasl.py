@@ -45,7 +45,8 @@ random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 print("device:", DEVICE)
 
 # TODO: point these at your uploaded files
-WLASL_JSON      = "/content/WLASL_v0.3.json"
+WLASL_JSON      = "/content/WLASL_v0.3.json"          # official metadata: has signer_id
+PARSED_JSON     = "/content/wlasl/WLASL_parsed_data.json"  # Kaggle metadata: list index == landmarks_V3.npz key
 LANDMARKS_NPZ   = "/content/wlasl/landmarks_V3.npz"
 EMBED_DIM   = 256
 SEQ_LEN     = 32            # matches alphabet TEMPLATE_LEN
@@ -90,24 +91,34 @@ def clip_to_template(seq: np.ndarray) -> np.ndarray:
 
 # %%
 class WLASLClips(Dataset):
-    """Cross-references official WLASL_v0.3.json (signer_id, split) against
-    the Kaggle landmarks_V3.npz (keypoints, keyed by video_id string)."""
+    """landmarks_V3.npz is keyed by the INDEX into WLASL_parsed_data.json
+    (verified: all 21083 npz keys are valid indices into that list) — NOT
+    the official video_id directly. So: npz key -> parsed[key] gives
+    {gloss, video_path, split}; video_id is parsed from video_path's
+    filename; that video_id is then looked up in the OFFICIAL
+    WLASL_v0.3.json (the only place signer_id lives)."""
     def __init__(self, split="train"):
         with open(WLASL_JSON, encoding="utf-8") as f:
             wlasl = json.load(f)
+        with open(PARSED_JSON, encoding="utf-8") as f:
+            parsed = json.load(f)
         self.npz = np.load(LANDMARKS_NPZ, allow_pickle=True)
-        available = set(self.npz.keys())
 
-        self.items = []   # (video_id, gloss, signer_id)
+        signer_of = {}   # video_id -> signer_id, from the official metadata
         for entry in wlasl:
-            gloss = entry["gloss"]
             for inst in entry["instances"]:
-                if inst["split"] != split:
-                    continue
-                vid = inst["video_id"]
-                if vid not in available:          # not every official video has landmarks here
-                    continue
-                self.items.append((vid, gloss, inst["signer_id"]))
+                signer_of[inst["video_id"]] = inst["signer_id"]
+
+        self.items = []   # (npz_key, gloss, signer_id)
+        for npz_key in self.npz.keys():
+            p = parsed[int(npz_key)]
+            if p["split"] != split:
+                continue
+            vid = Path(p["video_path"]).stem     # ".../12327.mp4" -> "12327"
+            signer = signer_of.get(vid)
+            if signer is None:                   # shouldn't happen if both files are in sync
+                continue
+            self.items.append((npz_key, p["gloss"], signer))
 
         self.by_sign = {}
         for i, (_, gloss, _) in enumerate(self.items):
