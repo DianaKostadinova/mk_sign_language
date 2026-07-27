@@ -70,7 +70,9 @@ EPOCHS      = 40
 # (this is the whole point of the pivot: no coarse descriptor needed here).
 import sys; sys.path.append(".")
 try:
-    from dtw_common import _hand_shape, _arm_feat, HAND_SHAPE_DIM, ARM_WEIGHT, make_template, POS_DIM
+    from dtw_common import (_hand_shape, _arm_feat, HAND_SHAPE_DIM, ARM_WEIGHT,
+                            make_template, POS_DIM, mirror_sequence,
+                            resample_sequence, VEL_WEIGHT)
 except ImportError:
     raise SystemExit("Upload alphabet/dtw_common.py next to this notebook first.")
 
@@ -193,10 +195,73 @@ def precompute_templates(split="train", shard_size=2000):
             n += 1; bk, bt, bg, bs = [], [], [], []
     print(f"[{split}] complete in {(time.time()-t0)/60:.1f} min", flush=True)
 
+_CACHE_ALLOWED = None
+
+def _allowed_from_cache():
+    """The MAX_GLOSSES most frequent glosses, counted from the train shards.
+    Same set for train and test, so the two splits stay comparable.
+    None when MAX_GLOSSES == 0 (use everything)."""
+    global _CACHE_ALLOWED
+    if not MAX_GLOSSES:
+        return None
+    if _CACHE_ALLOWED is None:
+        cnt = {}
+        for sp in _shard_paths("train"):
+            for g in np.load(sp, allow_pickle=True)["glosses"]:
+                cnt[str(g)] = cnt.get(str(g), 0) + 1
+        _CACHE_ALLOWED = set(sorted(cnt, key=lambda g: -cnt[g])[:MAX_GLOSSES])
+        print(f"MAX_GLOSSES={MAX_GLOSSES}: restricted to {len(_CACHE_ALLOWED)} glosses")
+    return _CACHE_ALLOWED
+
+def augment_template(t: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Random view of a cached (32, POS_DIM*2) template.
+
+    Without this the pipeline is fully deterministic — one clip always yields
+    the exact same vector — so with ~7 clips per gloss the encoder just
+    memorises them (measured: 71.5% train retrieval, 0.24% test). Every
+    transform here is label-preserving: the sign is the same, the performance
+    of it differs.
+
+    Velocity is recomputed rather than transformed, so it always matches the
+    positions it is paired with."""
+    P   = POS_DIM
+    H   = HAND_SHAPE_DIM
+    pos = t[:, :P].astype(np.float32).copy()
+    L   = len(pos)
+    # a hand absent from the source clip is an exact zero block, and must stay
+    # one — that is how it looks at inference time.
+    present = [bool(np.any(pos[:, :H])), bool(np.any(pos[:, H:2 * H]))]
+
+    # different speed / slightly different trim boundaries
+    if rng.random() < 0.8:
+        span  = int(rng.integers(int(0.7 * L), L + 1))
+        start = int(rng.integers(0, L - span + 1))
+        pos   = resample_sequence(pos[start:start + span], L)
+
+    # opposite-handed signer (hand-shape descriptors are mirror-invariant)
+    if rng.random() < 0.5:
+        pos = mirror_sequence(pos)
+        present.reverse()
+
+    pos = pos + rng.normal(0, 0.02, pos.shape).astype(np.float32)
+
+    # a hand the tracker lost for this take — only ever drop one of two, never
+    # the last remaining hand
+    if rng.random() < 0.15 and all(present):
+        present[int(rng.random() < 0.5)] = False
+
+    # zeroing happens last so dropped/absent hands are exactly zero, not noise
+    for i, p in enumerate(present):
+        if not p:
+            pos[:, i * H:(i + 1) * H] = 0
+
+    vel = np.diff(pos, axis=0, prepend=pos[:1]) * VEL_WEIGHT
+    return np.concatenate([pos, vel], axis=1).astype(np.float32)
+
 class WLASLClips(Dataset):
     """Reads only the precomputed Drive shards — no landmark decoding, no
     feature extraction. Startup after a reconnect is seconds, not an hour."""
-    def __init__(self, split="train"):
+    def __init__(self, split="train", augment=False):
         shards = _shard_paths(split)
         if not shards:
             raise SystemExit(f"No cache for '{split}'. Run precompute_templates('{split}') first.")
@@ -204,8 +269,21 @@ class WLASLClips(Dataset):
         for sp in shards:
             d = np.load(sp, allow_pickle=True)
             T.append(d["templates"]); G += d["glosses"].tolist(); S += d["signers"].tolist()
-        self.templates = np.concatenate(T).astype(np.float32)
+        templates = np.concatenate(T).astype(np.float32)
+
+        # MAX_GLOSSES has to be applied here too, not just in precompute — the
+        # shards on Drive hold the full vocabulary, so filtering only at
+        # precompute time would silently do nothing once the cache exists.
+        allowed = _allowed_from_cache()
+        if allowed is not None:
+            keep = [i for i, g in enumerate(G) if g in allowed]
+            templates = templates[keep]
+            G = [G[i] for i in keep]; S = [S[i] for i in keep]
+
+        self.templates = templates
         self.glosses, self.signers = G, [int(x) for x in S]
+        self.augment = augment
+        self._rng    = np.random.default_rng(SEED)
 
         self.by_sign = {}
         for i, gloss in enumerate(G):
@@ -217,7 +295,10 @@ class WLASLClips(Dataset):
     def __len__(self): return len(self.glosses)
 
     def __getitem__(self, i):
-        return self.templates[i], self.glosses[i], self.signers[i]
+        t = self.templates[i]
+        if self.augment:
+            t = augment_template(t, self._rng)
+        return t, self.glosses[i], self.signers[i]
 
 class PKSampler(torch.utils.data.Sampler):
     """Yield batches of P signs x K clips (varied signers) for contrastive loss."""
@@ -236,11 +317,14 @@ class PKSampler(torch.utils.data.Sampler):
 
 # %%
 class SignEncoder(nn.Module):
-    def __init__(self, in_dim, hidden=256, embed=EMBED_DIM, layers=2):
+    # dropout raised 0.1 -> 0.3 alongside augmentation: with ~7 clips per gloss
+    # the earlier config memorised the training set (71.5% train / 0.24% test).
+    def __init__(self, in_dim, hidden=256, embed=EMBED_DIM, layers=2, dropout=0.3):
         super().__init__()
         self.gru  = nn.GRU(in_dim, hidden, layers, batch_first=True,
-                           bidirectional=True, dropout=0.1)
-        self.head = nn.Sequential(nn.Linear(2 * hidden, embed), nn.ReLU(),
+                           bidirectional=True, dropout=dropout)
+        self.head = nn.Sequential(nn.Dropout(dropout),
+                                  nn.Linear(2 * hidden, embed), nn.ReLU(),
                                   nn.Linear(embed, embed))
     def forward(self, x):
         h, _ = self.gru(x)
@@ -314,13 +398,13 @@ def _save_ckpt(ckpt_path, model, opt, sched, epoch, complete):
                 "sched": sched.state_dict(), "epoch": epoch, "complete": complete}, ckpt_path)
 
 def run_training(ckpt_path: str = CKPT_PATH):
-    train_ds = WLASLClips("train")
-    val_ds   = WLASLClips("test")
+    train_ds = WLASLClips("train", augment=True)
+    val_ds   = WLASLClips("test")            # never augmented
     in_dim   = train_ds[0][0].shape[-1]
     train_ld = DataLoader(train_ds, batch_sampler=PKSampler(train_ds), collate_fn=collate)
 
     model = SignEncoder(in_dim).to(DEVICE)
-    opt   = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
+    opt   = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-2)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, EPOCHS)
 
     start_epoch = 0
