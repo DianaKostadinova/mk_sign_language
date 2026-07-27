@@ -74,14 +74,24 @@ try:
 except ImportError:
     raise SystemExit("Upload alphabet/dtw_common.py next to this notebook first.")
 
-# landmarks_V3.npz layout: (T, 553, 3) = 42 (hands) + 33 (pose) + 478 (face).
-# Confirmed from the dataset author's own extraction code (Kaggle notebook):
-# block order is [left_hand(21), right_hand(21), pose(33), face(478)] —
-# NOT the naive pose-face-hands guess, which failed the wrist-alignment
-# sanity check earlier. VERIFY again below before trusting this fully.
-LHAND_SLICE = slice(0, 21)
-RHAND_SLICE = slice(21, 42)
-POSE_SLICE  = slice(42, 75)     # 33 points, standard order -> local idx 15/16 = wrists
+# landmarks_V3.npz layout: (T, 553, 3) = 478 (face) + 33 (pose) + 21 + 21 (hands).
+#
+# MEASURED, not assumed (2026-07-27, 40 random clips, all four plausible block
+# orders scored by median ||pose_wrist - hand_root||, which must be ~0 for the
+# correct one):
+#
+#   face,pose,LH,RH  (this)  L=0.041  R=0.030   <- winner, ~7x better
+#   pose,LH,RH,face          L=0.245  R=0.191
+#   LH,RH,pose,face          L=0.264  R=0.209   <- what this file used to assume
+#   pose,face,LH,RH          L=0.302  R=0.309
+#
+# The earlier [LH,RH,pose,face] guess was wrong; it produced hand features that
+# looked superficially reasonable but were misaligned with the body. Re-run
+# sanity_check_layout() if the dataset is ever re-released.
+FACE_SLICE  = slice(0, 478)
+POSE_SLICE  = slice(478, 511)   # 33 points, standard order -> local idx 15/16 = wrists
+LHAND_SLICE = slice(511, 532)
+RHAND_SLICE = slice(532, 553)
 
 def frame_feature(row: np.ndarray) -> np.ndarray:
     """One (553,3) holistic frame -> (POS_DIM,) feature, matching dtw_common exactly."""
@@ -372,18 +382,62 @@ def predict(clip_template: np.ndarray, gallery_npz="data/landmarks/word_embeddin
 # %% [markdown]
 # ## Sanity check BEFORE training: verify the 553-point layout assumption
 #
-# Run this first. If hand features look degenerate (near-zero variance
-# across fingers), the POSE_SLICE/LHAND_SLICE/RHAND_SLICE indices above are
-# wrong and need adjusting before trusting anything downstream.
+# Run this first, and read the verdict. The npz ships 553 unlabelled points per
+# frame, so the block order is inferred, not given — and an earlier inference
+# was already wrong once.
+#
+# The test: if the slices are right, the POSE skeleton's wrist (pose idx 15/16)
+# and the HAND block's root landmark (idx 0) describe the same physical joint,
+# so they must nearly coincide. A wrong layout measures the gap between two
+# unrelated body parts and scores far worse. Eyeballing per-finger variance is
+# NOT sufficient — a misaligned hand block still has plausible-looking variance,
+# which is exactly how the earlier wrong layout slipped through.
 
 # %%
-def sanity_check_layout():
-    npz = np.load(LANDMARKS_NPZ, allow_pickle=True)
-    key = list(npz.keys())[0]
-    seq = np.asarray(npz[key])
-    print(f"sample '{key}' shape: {seq.shape}")
-    mid = seq[len(seq) // 2]
-    lh, rh = mid[LHAND_SLICE], mid[RHAND_SLICE]
-    print(f"left hand block std (x,y,z): {lh.std(axis=0)}")
-    print(f"right hand block std (x,y,z): {rh.std(axis=0)}")
-    print("(expect non-trivial, non-zero std in x/y if this is really a hand)")
+def sanity_check_layout(n_clips=40, stride=5, thresh=0.10):
+    """Score the configured slices by wrist alignment, and cross-check every
+    other plausible block order. Returns True if the current layout wins."""
+    npz  = np.load(LANDMARKS_NPZ, allow_pickle=True)
+    keys = list(npz.keys())
+    rng  = random.Random(0)
+    sample = rng.sample(keys, min(n_clips, len(keys)))
+
+    cands = {
+        "face,pose,LH,RH": (slice(511, 532), slice(532, 553), slice(478, 511)),
+        "LH,RH,pose,face": (slice(0, 21),    slice(21, 42),   slice(42, 75)),
+        "pose,LH,RH,face": (slice(33, 54),   slice(54, 75),   slice(0, 33)),
+        "pose,face,LH,RH": (slice(511, 532), slice(532, 553), slice(0, 33)),
+    }
+    current = (LHAND_SLICE, RHAND_SLICE, POSE_SLICE)
+
+    print(f"sample shape: {np.asarray(npz[sample[0]]).shape}   "
+          f"({len(sample)} clips, every {stride}th frame)\n")
+    results = {}
+    for name, (ls, rs, ps) in cands.items():
+        dl, dr, nl, nr, nf = [], [], 0, 0, 0
+        for k in sample:
+            for f in np.asarray(npz[k])[::stride]:
+                nf += 1
+                lh, rh, po = f[ls][:, :2], f[rs][:, :2], f[ps][:, :2]
+                if np.any(lh):
+                    nl += 1
+                    if np.any(po): dl.append(np.linalg.norm(po[15] - lh[0]))
+                if np.any(rh):
+                    nr += 1
+                    if np.any(po): dr.append(np.linalg.norm(po[16] - rh[0]))
+        med = lambda a: float(np.median(a)) if a else float("inf")
+        results[name] = max(med(dl), med(dr))
+        mark = " <- CONFIGURED" if (ls, rs, ps) == current else ""
+        print(f"  {name:16s} hands present L={nl/nf:5.1%} R={nr/nf:5.1%}   "
+              f"wrist err L={med(dl):.4f} R={med(dr):.4f}{mark}")
+
+    best = min(results, key=results.get)
+    cfg  = next((n for n, s in cands.items() if s == current), None)
+    print()
+    if cfg == best and results[best] < thresh:
+        print(f"PASS — '{best}' wins at {results[best]:.4f} and is what's configured.")
+        return True
+    print(f"FAIL — best layout is '{best}' ({results[best]:.4f}), "
+          f"configured is '{cfg}' ({results.get(cfg, float('inf')):.4f}).")
+    print("Fix FACE/POSE/LHAND/RHAND_SLICE before running anything else.")
+    return False
