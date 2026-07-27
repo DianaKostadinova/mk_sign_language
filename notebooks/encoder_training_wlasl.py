@@ -265,26 +265,45 @@ def collate(batch):
     return torch.tensor(np.stack(xs)), labels, torch.tensor(signers)
 
 @torch.no_grad()
-def evaluate_heldout(model, val_ds, gallery_per_sign=1):
-    """kNN among held-out (test-split) signers: one signer's clip = gallery, others = query."""
+def evaluate_heldout(model, val_ds, bs=128, verbose=False):
+    """One-shot cross-signer retrieval over the WHOLE held-out vocabulary.
+
+    For each gloss: one clip is enrolled as that gloss's single gallery entry
+    (exactly how a Macedonian word gets enrolled from its one video), and every
+    other clip of that gloss performed by a DIFFERENT signer becomes a query.
+    Chance is 1/n_glosses.
+
+    NB this replaces an earlier version that used a single signer's clips as the
+    entire gallery. That was fine for AUTSL, where all 43 signers perform all 226
+    signs — but on WLASL each signer contributes only a handful of the 2000
+    glosses, so the gallery covered a tiny slice of the vocabulary and every
+    query outside it was unanswerable. It would have reported near-zero no
+    matter how well the encoder worked."""
     model.eval()
-    embs, glosses, signers = [], [], []
-    for x, g, sg in DataLoader(val_ds, batch_size=64,
-                                collate_fn=lambda b: (torch.tensor(np.stack([i[0] for i in b])),
-                                                       [i[1] for i in b],
-                                                       [i[2] for i in b])):
-        embs.append(model(x.to(DEVICE)).cpu())
-        glosses += g; signers += sg
-    E = torch.cat(embs); glosses = np.array(glosses); signers = np.array(signers)
-    if len(set(signers)) < 2:
+    embs = []
+    for i in range(0, len(val_ds), bs):
+        xb = val_ds.templates[i:i + bs]
+        embs.append(model(torch.tensor(xb).to(DEVICE)).cpu())
+    E       = torch.cat(embs)
+    glosses = np.array(val_ds.glosses)
+    signers = np.array(val_ds.signers)
+
+    gal_idx   = np.array([idxs[0] for idxs in val_ds.by_sign.values()])
+    gal_gloss = np.array(list(val_ds.by_sign.keys()))
+    gal_signer_of = dict(zip(gal_gloss, signers[gal_idx]))
+
+    qry = np.ones(len(glosses), bool)
+    qry[gal_idx] = False
+    qry &= np.array([signers[i] != gal_signer_of[glosses[i]] for i in range(len(glosses))])
+    if not qry.any():
         return 0.0
-    gal = signers == sorted(set(signers))[0]
-    qry = ~gal
-    if gal.sum() == 0 or qry.sum() == 0:
-        return 0.0
-    sim = E[qry] @ E[gal].t()
-    pred = glosses[gal][sim.argmax(1).numpy()]
-    return float((pred == glosses[qry]).mean())
+
+    pred = gal_gloss[(E[qry] @ E[gal_idx].t()).argmax(1).numpy()]
+    acc  = float((pred == glosses[qry]).mean())
+    if verbose:
+        print(f"  eval: {len(gal_idx)} glosses enrolled, {int(qry.sum())} "
+              f"cross-signer queries, chance {1/len(gal_idx):.2%}")
+    return acc
 
 PRINT_INTERVAL_S = 10    # progress line at least this often, regardless of batch speed
 CKPT_INTERVAL_S  = 120   # mid-epoch checkpoint this often — first epoch (cache build) can be slow
@@ -335,7 +354,7 @@ def run_training(ckpt_path: str = CKPT_PATH):
                 print(f"  (mid-epoch checkpoint saved, batch {b+1}/{len(train_ld)})", flush=True)
                 last_ckpt = now
         sched.step()
-        acc = evaluate_heldout(model, val_ds)
+        acc = evaluate_heldout(model, val_ds, verbose=(epoch == start_epoch))
         print(f"epoch {epoch:02d}  loss {loss.item():.3f}  held-out top-1 {acc:.1%}", flush=True)
         if ckpt_path:
             _save_ckpt(ckpt_path, model, opt, sched, epoch, complete=True)
