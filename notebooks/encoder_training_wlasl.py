@@ -72,7 +72,7 @@ import sys; sys.path.append(".")
 try:
     from dtw_common import (_hand_shape, _arm_feat, HAND_SHAPE_DIM, ARM_WEIGHT,
                             make_template, POS_DIM, mirror_sequence,
-                            resample_sequence, VEL_WEIGHT)
+                            resample_sequence, smooth_sequence, VEL_WEIGHT)
 except ImportError:
     raise SystemExit("Upload alphabet/dtw_common.py next to this notebook first.")
 
@@ -245,6 +245,12 @@ def augment_template(t: np.ndarray, rng: np.random.Generator) -> np.ndarray:
 
     pos = pos + rng.normal(0, 0.02, pos.shape).astype(np.float32)
 
+    # Smooth BEFORE differencing, exactly as make_template does. Skipping this
+    # let the injected jitter through np.diff * VEL_WEIGHT (=8), so the noise
+    # landed in the velocity half amplified ~8x — swamping the real motion
+    # signal in half of every feature vector.
+    pos = smooth_sequence(pos)
+
     # a hand the tracker lost for this take — only ever drop one of two, never
     # the last remaining hand
     if rng.random() < 0.15 and all(present):
@@ -317,14 +323,16 @@ class PKSampler(torch.utils.data.Sampler):
 
 # %%
 class SignEncoder(nn.Module):
-    # dropout raised 0.1 -> 0.3 alongside augmentation: with ~7 clips per gloss
-    # the earlier config memorised the training set (71.5% train / 0.24% test).
-    def __init__(self, in_dim, hidden=256, embed=EMBED_DIM, layers=2, dropout=0.3):
+    # dropout stays at 0.1. Raising it to 0.3 together with augmentation and a
+    # 100x weight-decay bump collapsed training outright: loss sat at exactly
+    # ln(127) = 4.844 for 8 epochs, the closed-form value for "all embeddings
+    # identical". Augmentation is the overfitting fix; regularisation should
+    # only be added back one step at a time, verifying loss still falls.
+    def __init__(self, in_dim, hidden=256, embed=EMBED_DIM, layers=2, dropout=0.1):
         super().__init__()
         self.gru  = nn.GRU(in_dim, hidden, layers, batch_first=True,
                            bidirectional=True, dropout=dropout)
-        self.head = nn.Sequential(nn.Dropout(dropout),
-                                  nn.Linear(2 * hidden, embed), nn.ReLU(),
+        self.head = nn.Sequential(nn.Linear(2 * hidden, embed), nn.ReLU(),
                                   nn.Linear(embed, embed))
     def forward(self, x):
         h, _ = self.gru(x)
@@ -389,6 +397,17 @@ def evaluate_heldout(model, val_ds, bs=128, verbose=False):
               f"cross-signer queries, chance {1/len(gal_idx):.2%}")
     return acc
 
+@torch.no_grad()
+def embed_spread(model, ds, n=512):
+    """Mean pairwise cosine over a sample of embeddings. ~0 = well spread,
+    ~1 = collapsed to a single point. Printed every epoch because a collapse is
+    otherwise invisible: the loss just parks at ln(P*K-1) and never moves."""
+    model.eval()
+    idx = np.random.default_rng(0).choice(len(ds.templates),
+                                          min(n, len(ds.templates)), replace=False)
+    E = model(torch.tensor(ds.templates[idx]).to(DEVICE))
+    return float((E @ E.t()).mean())
+
 PRINT_INTERVAL_S = 10    # progress line at least this often, regardless of batch speed
 CKPT_INTERVAL_S  = 120   # mid-epoch checkpoint this often — first epoch (cache build) can be slow
 
@@ -404,7 +423,7 @@ def run_training(ckpt_path: str = CKPT_PATH):
     train_ld = DataLoader(train_ds, batch_sampler=PKSampler(train_ds), collate_fn=collate)
 
     model = SignEncoder(in_dim).to(DEVICE)
-    opt   = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-2)
+    opt   = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, EPOCHS)
 
     start_epoch = 0
@@ -438,8 +457,11 @@ def run_training(ckpt_path: str = CKPT_PATH):
                 print(f"  (mid-epoch checkpoint saved, batch {b+1}/{len(train_ld)})", flush=True)
                 last_ckpt = now
         sched.step()
-        acc = evaluate_heldout(model, val_ds, verbose=(epoch == start_epoch))
-        print(f"epoch {epoch:02d}  loss {loss.item():.3f}  held-out top-1 {acc:.1%}", flush=True)
+        acc    = evaluate_heldout(model, val_ds, verbose=(epoch == start_epoch))
+        spread = embed_spread(model, val_ds)
+        warn   = "   <-- COLLAPSED, stop and fix" if spread > 0.9 else ""
+        print(f"epoch {epoch:02d}  loss {loss.item():.3f}  held-out top-1 {acc:.1%}"
+              f"  cos {spread:+.3f}{warn}", flush=True)
         if ckpt_path:
             _save_ckpt(ckpt_path, model, opt, sched, epoch, complete=True)
     return model
