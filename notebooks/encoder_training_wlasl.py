@@ -477,7 +477,10 @@ def run_training(ckpt_path: str = CKPT_PATH):
         sched.step()
         acc    = evaluate_heldout(model, val_ds, verbose=(epoch == start_epoch))
         spread = embed_spread(model, val_ds)
-        warn   = "   <-- COLLAPSED, stop and fix" if spread > 0.9 else ""
+        # cos legitimately starts ~1.0 and falls over the first ~10 epochs
+        # (measured on the no-augmentation baseline: 0.996 -> 0.444 by epoch 13).
+        # Only a value still pinned high AFTER that window means a real collapse.
+        warn   = "   <-- still collapsed" if (spread > 0.9 and epoch >= 12) else ""
         print(f"epoch {epoch:02d}  loss {loss.item():.3f}  held-out top-1 {acc:.1%}"
               f"  cos {spread:+.3f}{warn}", flush=True)
         if ckpt_path:
