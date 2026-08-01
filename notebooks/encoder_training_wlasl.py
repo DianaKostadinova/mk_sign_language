@@ -59,6 +59,20 @@ CKPT_PATH = os.environ.get("WLASL_CKPT",      "/content/drive/MyDrive/wlasl/sign
 # before committing to the long one — the N most frequent glosses in train.
 MAX_GLOSSES = int(os.environ.get("WLASL_MAX_GLOSSES", "0"))
 
+# Which augmentations to apply, comma-separated; "none" disables all.
+#   crop   - random temporal crop + resample  (speed / trim variation)
+#   noise  - gaussian landmark jitter
+#   mirror - swap hand slots                  (opposite-handed signer)
+#   drop   - zero one of two hands            (tracker loses a hand)
+#
+# Default excludes `mirror` deliberately. With crop+noise+mirror+drop the run
+# collapsed on real data (all embeddings identical, loss pinned at ln(P*K-1));
+# mirror is the aggressive one, because WLASL has many one-handed signs and
+# swapping slots moves that hand's whole 31-dim block, so one gloss shows up in
+# two unrelated layouts. Re-enable it only after verifying loss still falls.
+AUG = {a.strip() for a in os.environ.get("WLASL_AUG", "crop,noise").split(",")
+       if a.strip() and a.strip() != "none"}
+
 EMBED_DIM   = 256
 SEQ_LEN     = 32            # matches alphabet TEMPLATE_LEN
 BATCH_SIGNS = 32            # P signs per batch
@@ -233,17 +247,18 @@ def augment_template(t: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     present = [bool(np.any(pos[:, :H])), bool(np.any(pos[:, H:2 * H]))]
 
     # different speed / slightly different trim boundaries
-    if rng.random() < 0.8:
+    if "crop" in AUG and rng.random() < 0.8:
         span  = int(rng.integers(int(0.7 * L), L + 1))
         start = int(rng.integers(0, L - span + 1))
         pos   = resample_sequence(pos[start:start + span], L)
 
     # opposite-handed signer (hand-shape descriptors are mirror-invariant)
-    if rng.random() < 0.5:
+    if "mirror" in AUG and rng.random() < 0.5:
         pos = mirror_sequence(pos)
         present.reverse()
 
-    pos = pos + rng.normal(0, 0.02, pos.shape).astype(np.float32)
+    if "noise" in AUG:
+        pos = pos + rng.normal(0, 0.02, pos.shape).astype(np.float32)
 
     # Smooth BEFORE differencing, exactly as make_template does. Skipping this
     # let the injected jitter through np.diff * VEL_WEIGHT (=8), so the noise
@@ -253,7 +268,7 @@ def augment_template(t: np.ndarray, rng: np.random.Generator) -> np.ndarray:
 
     # a hand the tracker lost for this take — only ever drop one of two, never
     # the last remaining hand
-    if rng.random() < 0.15 and all(present):
+    if "drop" in AUG and rng.random() < 0.15 and all(present):
         present[int(rng.random() < 0.5)] = False
 
     # zeroing happens last so dropped/absent hands are exactly zero, not noise
@@ -417,8 +432,9 @@ def _save_ckpt(ckpt_path, model, opt, sched, epoch, complete):
                 "sched": sched.state_dict(), "epoch": epoch, "complete": complete}, ckpt_path)
 
 def run_training(ckpt_path: str = CKPT_PATH):
-    train_ds = WLASLClips("train", augment=True)
+    train_ds = WLASLClips("train", augment=bool(AUG))
     val_ds   = WLASLClips("test")            # never augmented
+    print(f"augmentations: {sorted(AUG) if AUG else 'none'}", flush=True)
     in_dim   = train_ds[0][0].shape[-1]
     train_ld = DataLoader(train_ds, batch_sampler=PKSampler(train_ds), collate_fn=collate)
 
@@ -445,7 +461,9 @@ def run_training(ckpt_path: str = CKPT_PATH):
         for b, (x, labels, _) in enumerate(train_ld):
             x = x.to(DEVICE)
             loss = supcon_loss(model(x), labels.to(DEVICE))
-            opt.zero_grad(); loss.backward(); opt.step()
+            opt.zero_grad(); loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            opt.step()
 
             now = time.time()
             if now - last_print >= PRINT_INTERVAL_S:
