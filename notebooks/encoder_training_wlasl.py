@@ -73,6 +73,12 @@ MAX_GLOSSES = int(os.environ.get("WLASL_MAX_GLOSSES", "0"))
 AUG = {a.strip() for a in os.environ.get("WLASL_AUG", "crop,noise").split(",")
        if a.strip() and a.strip() != "none"}
 
+# SupCon temperature. 0.07 is the paper default but is on the sharp end: at
+# initialisation every cosine is ~0, so dividing by 0.07 amplifies pure noise
+# into a peaked softmax and the run spends ~10 epochs crawling out of the
+# all-embeddings-identical plateau. Raising it smooths early gradients.
+TEMP = float(os.environ.get("WLASL_TEMP", "0.07"))
+
 EMBED_DIM   = 256
 SEQ_LEN     = 32            # matches alphabet TEMPLATE_LEN
 BATCH_SIGNS = 32            # P signs per batch
@@ -355,7 +361,8 @@ class SignEncoder(nn.Module):
         return F.normalize(z, dim=-1)
 
 # %%
-def supcon_loss(z, labels, temp=0.07):
+def supcon_loss(z, labels, temp=None):
+    temp = TEMP if temp is None else temp
     sim = z @ z.t() / temp
     sim.fill_diagonal_(-1e9)
     pos = (labels.view(-1, 1) == labels.view(1, -1)).float()
@@ -430,6 +437,63 @@ def _save_ckpt(ckpt_path, model, opt, sched, epoch, complete):
     Path(ckpt_path).parent.mkdir(parents=True, exist_ok=True)
     torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
                 "sched": sched.state_dict(), "epoch": epoch, "complete": complete}, ckpt_path)
+
+def sweep(configs=None, batches=1200, report_every=200, seed=0):
+    """Run several settings side by side for a fixed number of batches and
+    report which escapes the all-embeddings-identical plateau fastest.
+
+    Exists because the plateau makes single runs unreadable by eye: loss moves
+    from 4.84 to only ~4.72 over the first five epochs whatever the setting, so
+    "is this working" cannot be answered by watching one run for a few minutes.
+    Comparing cos trajectories across configs answers it in one pass.
+    Touches no checkpoints."""
+    global AUG, TEMP
+    if configs is None:
+        configs = [dict(temp=0.07, lr=3e-4, aug="crop,noise"),   # current
+                   dict(temp=0.15, lr=3e-4, aug="crop,noise"),
+                   dict(temp=0.07, lr=1e-3, aug="crop,noise"),
+                   dict(temp=0.15, lr=1e-3, aug="crop,noise")]
+    saved = (set(AUG), TEMP)
+    ds = WLASLClips("train", augment=True)
+    print(f"\nsweep: {len(configs)} configs x {batches} batches "
+          f"({len(ds)} clips, {len(ds.signs)} glosses)\n", flush=True)
+    rows = []
+    try:
+        for cfg in configs:
+            AUG  = {a.strip() for a in cfg["aug"].split(",")
+                    if a.strip() and a.strip() != "none"}
+            TEMP = cfg["temp"]
+            ds.augment = bool(AUG)
+            ds._rng    = np.random.default_rng(seed)
+            torch.manual_seed(seed); random.seed(seed)
+
+            ld = DataLoader(ds, batch_sampler=PKSampler(ds, batches=batches),
+                            collate_fn=collate)
+            m  = SignEncoder(ds.templates.shape[-1]).to(DEVICE)
+            o  = torch.optim.AdamW(m.parameters(), lr=cfg["lr"], weight_decay=1e-4)
+            tag = f"temp={cfg['temp']:<5g} lr={cfg['lr']:<6g} aug={cfg['aug']}"
+
+            last = (float("nan"), float("nan"))
+            for b, (x, lab, _) in enumerate(ld, 1):
+                m.train()
+                loss = supcon_loss(m(x.to(DEVICE)), lab.to(DEVICE))
+                o.zero_grad(); loss.backward()
+                torch.nn.utils.clip_grad_norm_(m.parameters(), 5.0)
+                o.step()
+                if b % report_every == 0:
+                    c = embed_spread(m, ds)
+                    last = (loss.item(), c)
+                    print(f"  {tag}  b{b:5d}  loss {loss.item():.3f}  cos {c:+.3f}",
+                          flush=True)
+            rows.append((tag, *last))
+            print(flush=True)
+    finally:
+        AUG, TEMP = saved
+
+    print("=== summary: lowest cos escaped the plateau fastest ===")
+    for tag, l, c in sorted(rows, key=lambda r: r[2]):
+        print(f"  {tag}  final loss {l:.3f}  cos {c:+.3f}")
+    return rows
 
 def run_training(ckpt_path: str = CKPT_PATH):
     train_ds = WLASLClips("train", augment=bool(AUG))
