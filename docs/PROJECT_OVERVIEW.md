@@ -65,12 +65,31 @@ any learning happens.
 - `dtw_common.classify()` — DTW nearest-neighbour against all templates for
   a letter, using a Sakoe-Chiba banded DTW distance.
 
-**What was actually measured:** matching a live take against the
-*reference signer's own single video* fails on her webcam — all
-predictions collapse into one generic cluster, margins ≈ 1.0 (domain gap).
-Matching against **her own recorded takes** works well. Conclusion: the
-pipeline and features are correct; the system is currently
-**signer-dependent**. This is the direct motivation for the encoder work.
+**What was actually measured** (29 letters, chance 3.4%, DTW top-1):
+
+| | VEL_WEIGHT 8.0 | VEL_WEIGHT 1.0 |
+|---|---|---|
+| Reference trims vs each other (same video) | 99.1% | **100.0%** |
+| User's own takes vs each other (3 separate takes) | 71.3% | **86.2%** |
+| **User's webcam → reference videos (cross-domain)** | 12.6% | **26.4%** |
+| Letters with ≥1 correct cross-domain take | 4/29 | **9/29** |
+
+The cross-domain row is the honest measure of the live system, and it is the
+only genuine cross-recording benchmark that exists anywhere in this project —
+the same 29 classes captured twice under different conditions.
+
+Two conclusions. First, the features are **sound**: 86.2% across genuinely
+separate takes proves the descriptor captures sign identity across
+performances. The failure is specifically **domain shift** (camera, lighting,
+framing), not a broken representation.
+
+Second, `VEL_WEIGHT` was badly miscalibrated at 8.0. Velocity-only matching
+scores 4.6% against 3.4% chance — near-noise across domains — yet the ×8
+weighting let that block dominate the DTW distance. Lowering it to 1.0 roughly
+doubles cross-domain accuracy and improves *every* within-session case too, so
+it is not a trade-off. Templates bake this constant in, so stored `.npz` files
+must be rescaled when it changes; `alphabet/migrate_vel_weight.py` does that
+exactly (velocity half × new/old) without re-running MediaPipe.
 
 ## Words — Stage 0: does the representation survive at word scale?
 
@@ -144,6 +163,38 @@ weak signal for this training objective; held-out accuracy is the one that
 matters.)
 
 Trained encoder saved at `models/sign_encoder.pt`.
+
+## Words — Stage 1b: the WLASL attempt (abandoned, 2026-08-02)
+
+WLASL was tried as an upgrade over AUTSL: a Kaggle-hosted landmark release
+(`abd0kamel/mutemotion-output`) gives full 21-point hands, so no coarse
+descriptor compromise, and 2000 glosses instead of 226. Scaffold lives in
+`notebooks/encoder_training_wlasl.py` with a Colab runbook in
+`notebooks/wlasl_colab.ipynb`. **It does not work.** Recorded so nobody
+retries it blind:
+
+- The 553-point layout is `face(478) + pose(33) + LH(21) + RH(21)` — verified
+  by wrist alignment, since the pose wrist and hand root must coincide. Two
+  earlier guesses were wrong; `sanity_check_layout()` now scores all four
+  plausible orders and prints a verdict.
+- Trained without augmentation: **71.5% train / 0.24% test** retrieval. Pure
+  memorisation — the model can represent 2000 glosses but generalises nothing.
+- With even mild augmentation (3% noise + temporal crop) training stops
+  working entirely: embeddings stay collapsed (mean pairwise cosine > 0.99)
+  for thousands of batches. Temperature and learning-rate sweeps did not move
+  it. The identical code escapes to cos ≈ 0.08 within 400 batches on synthetic
+  data, so this is the data, not the implementation.
+
+Read together: if mild noise destroys all learnability, the signal being fitted
+was exact numeric memorisation, not sign structure. WLASL's YouTube-sourced
+footage yields hand landmarks too noisy for joint-angle descriptors, which
+amplify small tracking errors into large angle errors. **AUTSL remains the
+working encoder** (`models/sign_encoder.pt`, 66.2% held-out-signer on 226
+classes).
+
+Note the AUTSL encoder was trained on templates built with `VEL_WEIGHT=8.0`
+and so is stale relative to the current descriptor; `word_embeddings.npz`
+likewise. Both need rebuilding before use.
 
 ## Where things stand right now (in progress)
 

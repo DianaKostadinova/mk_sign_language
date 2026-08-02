@@ -32,7 +32,18 @@ from utils import pose_landmarks_from_result
 # better than coordinates. This is what makes cross-person matching possible.
 TEMPLATE_LEN = 32     # every sign (template or live segment) is resampled to this
 SMOOTH_WIN   = 3      # moving-average window over raw frames (kills landmark jitter)
-VEL_WEIGHT   = 8.0    # velocity contribution vs. position in the distance
+# Velocity weight. Was 8.0; lowered to 1.0 on 2026-08-02 after measuring it
+# against the only real cross-domain benchmark available (the 29 letters
+# recorded twice: reference videos vs. the user's own webcam takes). At 8.0 the
+# velocity block dominated the DTW distance while carrying almost no
+# domain-transferable signal — velocity-only matching scored 4.6% against 3.4%
+# chance. Measured sweep, cross-source top-1:
+#   vel 8.0 -> 12.6%   4.0 -> 17.2%   2.0 -> 21.8%   1.0 -> 26.4%   0 -> 25.3%
+# 1.0 is also >= 8.0 on every within-session case, so this is not a trade-off:
+#   reference LOO 99.1 -> 100.0 | user-takes LOO 71.3 -> 86.2 | words 98.0 -> 99.8
+# NB templates bake this in, so stored .npz templates must be rescaled (or
+# rebuilt) when this changes — mixing weights silently corrupts matching.
+VEL_WEIGHT   = 1.0    # velocity contribution vs. position in the distance
 ARM_WEIGHT   = 0.5    # arm/body-pose features weight relative to hand shape
 DTW_BAND     = 8      # Sakoe-Chiba band half-width (frames)
 
