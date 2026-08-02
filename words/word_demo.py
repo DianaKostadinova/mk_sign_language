@@ -43,7 +43,8 @@ sys.path.append(str(ROOT))
 sys.path.append(str(ROOT / "alphabet"))     # for `from dtw_common import ...` inside encoder_training.py
 sys.path.append(str(ROOT / "notebooks"))
 
-from alphabet.dtw_common import build_frame_coarse, make_template, COARSE_POS_DIM
+from alphabet.dtw_common import (build_frame_coarse, make_template,
+                                 COARSE_POS_DIM, VEL_WEIGHT)
 from alphabet.dtw_demo import (                 # reuse, don't reinvent
     make_hand_detector, make_pose_detector, draw_skeleton, draw_cyrillic,
     SignSegmenter,
@@ -71,6 +72,16 @@ def main():
     gallery_lab = np.array([str(x) for x in g["labels"]])
     print(f"Loaded gallery: {len(gallery_lab)} embeddings, "
           f"{len(set(gallery_lab))} unique words.")
+
+    # sign_encoder.pt was trained on templates built with VEL_WEIGHT=8.0, but
+    # dtw_common now uses 1.0, so a live template is out-of-distribution for it
+    # and scores near noise. Rescale the velocity half back to whatever the
+    # gallery was built at; words/build_gallery.py records that as encoder_vel.
+    encoder_vel = float(g["encoder_vel"]) if "encoder_vel" in g else 8.0
+    vel_scale   = encoder_vel / VEL_WEIGHT
+    if abs(vel_scale - 1.0) > 1e-9:
+        print(f"queries rescaled: velocity x{vel_scale:g} "
+              f"(VEL_WEIGHT {VEL_WEIGHT} -> encoder's {encoder_vel:g})")
 
     in_dim = COARSE_POS_DIM * 2   # make_template appends velocity, doubling the per-frame dim
 
@@ -119,6 +130,7 @@ def main():
         if segment is not None:
             t0 = time.time()
             tmpl = make_template(segment)                          # (32, COARSE_POS_DIM*2)
+            tmpl[:, COARSE_POS_DIM:] *= vel_scale                   # match encoder's weighting
             with torch.no_grad():
                 q = encoder(torch.tensor(tmpl[None], dtype=torch.float32).to(DEVICE))
                 sims = (q @ gallery_emb.t()).cpu().numpy()[0]
